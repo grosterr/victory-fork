@@ -2138,9 +2138,10 @@ mod tests {
 
     /// `PS_VoxelizeVisiblity`'s parking (0xa18-0xa38, 0xe44-0xe4c, 0x2df8, 0x3184): a lane
     /// mask parked in lanes 3 and 4 of v56 and taken back to make EXEC, later a single scalar
-    /// parked in lane 3. Built as it is, the mask comes back as two scalars, which the
-    /// structurisation cannot see into; with [`with_shared_slots`] it comes back as the pair
-    /// it is, and EXEC as the compare's lanes.
+    /// parked in lane 3. Built as it is, the mask comes back as two scalars (which the
+    /// structurisation follows back to the pair since fxceless#1112); with
+    /// [`with_shared_slots`] it comes back as the pair it is. Either way EXEC is the
+    /// compare's lanes.
     #[test]
     fn a_mask_parked_in_lanes_another_scalar_shares_comes_back_whole_with_shared_slots() {
         let writelane = |lane: u32, s: u32| [0xD761_0038, s | (128 + lane) << 9]; // v_writelane_b32 v56, s, lane
@@ -2180,7 +2181,10 @@ mod tests {
             let guard = st.guards[b][i].expect("a guard");
             st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(_)))
         };
-        assert!(opaque(&alone), "two scalars make an opaque mask");
+        // Since fxceless#1112 (`Lanes::move_source` in structure.rs) the two
+        // scalars are followed back to the pair they were moved from, so the
+        // mask is the compare's even without shared slots.
+        assert!(!opaque(&alone), "two scalar copies of the pair are the compare's mask");
         assert!(!opaque(&shared), "the pair is the compare's mask");
     }
 }
