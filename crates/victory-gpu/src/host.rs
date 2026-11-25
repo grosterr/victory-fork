@@ -6889,9 +6889,13 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
+        Self::run_steps(&self.deferred().copies, batch, wide_textures());
+    }
+
+    fn run_steps(steps: &[Step], batch: &mut Batch, wide: bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        for step in steps {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -6930,6 +6934,11 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                    } else if !batch.textures_due.is_empty() {
+                        // A host step may read what a queued texture check writes (levels on
+                        // demand map the levels `detile` has just held): the queue goes first,
+                        // in the order the steps were recorded, as without VICTORY_WIDE_TEXTURES.
+                        batch.refresh_textures();
                     }
                     work();
                     // It wrote title memory, where is not known here: the
@@ -6963,7 +6972,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        if wide_textures() {
+                        if wide {
                             batch.textures_due.push(staging.clone());
                         } else {
                             staging.refresh();
@@ -8564,6 +8573,102 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn queued_textures_refresh_before_host_step() {
+        use super::{HostList, PREPARING, Step};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        let rdesc: [u32; 14] = [3, 0, 0, 0, 128, 0, 128, (1 << 16) | 1, 98, 1, 0, 0x105, 0, 0];
+        let total = crate::resource::placed_bytes(&rdesc).expect("placed bytes") as usize;
+        let make_texture = |fill: u8| {
+            // SAFETY: private allocation owned by this test.
+            let base =
+                unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+            assert!(!base.is_null());
+            // SAFETY: `base..base + total` was just committed read-write.
+            unsafe { std::ptr::write_bytes(base, fill, total) };
+            let placed = crate::resource::texture_at(base as u64, &rdesc).expect("placed texture");
+            let tex = crate::resource::host_resource(placed).expect("host texture");
+            (base, placed, tex)
+        };
+
+        // 1) Exact `texture::upload` sequence followed by a host step (e.g. tile mapping).
+        let (base1, placed1, tex1) = make_texture(0x5a);
+        let list1 = host.make_list().expect("host list");
+        crate::texture::upload(&list1, placed1, tex1);
+        let before1 = PREPARING[3].load(Ordering::Relaxed);
+        let saw1 = Arc::new(AtomicU64::new(0));
+        let saw1_write = Arc::clone(&saw1);
+        list1.defer_host(move || {
+            saw1_write.store(PREPARING[3].load(Ordering::Relaxed) - before1, Ordering::Relaxed);
+        });
+        let mut batch1 = Batch::default();
+        HostList::run_steps(&list1.deferred().copies, &mut batch1, true);
+        assert!(
+            saw1.load(Ordering::Relaxed) >= total as u64,
+            "single queued texture must refresh before host step (saw {} bytes, expected >= {total})",
+            saw1.load(Ordering::Relaxed)
+        );
+        assert!(batch1.textures_due.is_empty());
+
+        // 2) Two queued textures (`wide_run` branch of `Batch::refresh_textures`) before a host step.
+        let (base2, placed2, tex2) = make_texture(0xa5);
+        let (base3, placed3, tex3) = make_texture(0x3c);
+        let list2 = host.make_list().expect("host list");
+        let list3 = host.make_list().expect("host list");
+        crate::texture::upload(&list2, placed2, tex2);
+        crate::texture::upload(&list3, placed3, tex3);
+        let tex_step_2 = list2
+            .deferred()
+            .copies
+            .drain(..)
+            .find(|s| matches!(s, Step::Texture(_)))
+            .expect("texture step 2");
+        let tex_step_3 = list3
+            .deferred()
+            .copies
+            .drain(..)
+            .find(|s| matches!(s, Step::Texture(_)))
+            .expect("texture step 3");
+        let before2 = PREPARING[3].load(Ordering::Relaxed);
+        let saw2 = Arc::new(AtomicU64::new(0));
+        let saw2_write = Arc::clone(&saw2);
+        let steps = vec![
+            tex_step_2,
+            tex_step_3,
+            Step::Host(Box::new(move || {
+                saw2_write.store(PREPARING[3].load(Ordering::Relaxed) - before2, Ordering::Relaxed);
+            })),
+        ];
+        let mut batch2 = Batch::default();
+        HostList::run_steps(&steps, &mut batch2, true);
+        assert!(
+            saw2.load(Ordering::Relaxed) >= (2 * total) as u64,
+            "multiple queued textures must refresh before host step (saw {} bytes, expected >= {})",
+            saw2.load(Ordering::Relaxed),
+            2 * total
+        );
+        assert!(batch2.textures_due.is_empty());
+
+        drop(steps);
+        drop(batch2);
+        drop(batch1);
+        drop(list3);
+        drop(list2);
+        drop(list1);
+        for (base, placed) in [(base1, placed1), (base2, placed2), (base3, placed3)] {
+            crate::texture::forget(placed as usize);
+            // SAFETY: freeing private allocations owned by this test.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+        }
     }
 
     /// The hashing a submission does for textures in physical-page memory,
