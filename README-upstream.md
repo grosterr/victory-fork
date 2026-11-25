@@ -46,6 +46,97 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 
 ### Newest (2026-11-25, later the same day)
 
+**Update, 2026-11-25 afternoon: what a frame is made of, measured, and two
+changes that hold.** First rooms, about 3,850 draws a frame: 104 ms a frame
+(9.6 frames a second) with the first two changes below, 97 ms (10.3)
+with all of them, from about 120 ms in the morning. Still far from the console's 33 ms.
+- How the title paces itself (new meters in `fence.rs` and
+  `console_insn.rs`): it never asks for an event. Each frame begins with
+  one small submission and a signal, and a title thread then waits for
+  that fence value by reading it in memory with `monitorx` / `mwaitx`
+  (AMD-only: about 280,000 emulated exceptions a second on an Intel
+  processor, all from this wait). The value is set when the layer has
+  finished the whole frame before. So a frame is the time the layer needs
+  for one frame's burst of submissions plus about 20 ms of the title's
+  own; putting presents behind the line, or giving the title's threads
+  more processors, changes nothing (both measured).
+- Two walls stand side by side and both are full: the layer's submit
+  thread (about 95 ms of a 120 ms frame in the morning) and the card
+  (about 102 ms busy, by a timestamp pair around every host list:
+  `cardmeter.rs`). Taking time off one alone moved the frame by 0 to 7 %.
+- `VICTORY_JOIN_PARTS=1` (off by default): the title's lists wait for
+  memory values, which cut its ~15 submissions a frame into ~29 parts;
+  parts that follow one another now go to the host as one submission
+  (9 a frame), the same lists in the same order. About 6 %.
+- `VICTORY_BACK_OWN_VIEW=1` (off by default): what shaders wrote goes
+  back into title view memory through a view of the layer's own, so the
+  copy that wrote it is not read in again. About 9 % (submit thread 93 ->
+  81 ms a frame, 104 -> 80 MB a frame checked). A CORRECTION: an earlier
+  run seemed to show washed-out frames with this switch; the same frames
+  turn up in about 6 of 21 runs with no switch at all (cause not known),
+  and `VICTORY_BACK_OWN_CHECK=1` counted 0 stores gone astray in 1.36
+  million.
+- Where the card's time goes now (`VICTORY_CARD_METER_PIPELINES=1`, a
+  table by pipeline): no pass is large. About 82 ms of the title's lists
+  are spread over ~3,400 pipeline bindings a frame; ~2,400 of the
+  indirect commands still get a clamp pass of the layer's with draw
+  windows on (960 are compute dispatches; about 1,000 are mesh records
+  the title keeps scattered through a 100 MB argument buffer, which a
+  window of records at one step cannot serve).
+- `VICTORY_INDIRECT_GATHER=1` (off by default): a single indirect record
+  that misses its window gets a slot in a scratch buffer of its list, and
+  the list's prelude clamps all such records in one pass by a table of
+  their offsets (the clamp shader with a gather bit), where each draw had
+  a compute pass of the layer's in front of it. Proved by clamping every
+  gathered record again at its draw and comparing on the card
+  (`VICTORY_INDIRECT_WINDOW_CHECK=1`): 7.9 million records, none differed.
+  About 600 of the ~1,600 draws that missed a window are served; the
+  others come after a dispatch or a storing draw in their list. With
+  `VICTORY_CARD_REHASH_RUNS=1`: 104 -> 97 ms a frame (10.3 frames a
+  second at 3,800 draws).
+- What the card's time is now, added up: of ~87 ms busy in a 97 ms
+  frame, the layer's own lists are ~19 ms and its clamp passes 10-20 ms;
+  about 50 ms are the title's own ~30 compute passes and its geometry at
+  2560x1440 as translated. With every pass of the layer's gone, this
+  scene would still be near 20 frames a second on this card: the
+  translated shaders have to get cheaper too.
+- The frame rate is drawn into the top left corner of every frame shown
+  (`fpsbox.rs`; `VICTORY_FPS_COUNTER=0`: not): the window's caption has
+  it too, but a capture of the picture does not carry the caption.
+- `VICTORY_COPY_CHANGED=1` (off by default): a refresh of a copy in the
+  card's memory sends on only the 256-byte chunks that differ from the
+  copy's CPU side. The layer's sync lists on the card fall from 12 to 8
+  ms a frame, the submit thread pays 3.6 ms for the compare and is then
+  the limit: no net gain yet.
+- HONEST LIMIT OF ALL THE ABOVE: those numbers are the scene standing
+  still. While the camera moves the title streams assets, and about half
+  the time goes to frames of ~490 ms in which the card is idle for ~330
+  ms: some 850 remaps of title memory, 260 texture uploads and 450 disk
+  reads in one frame. That is the next thing to measure and cut.
+- The dips while moving, measured (a sampling profile of the opening
+  cutscene, and a 370 s play session): the mean is 4.5 frames a second,
+  with half the time in frames of ~490 ms in which the card is idle for
+  ~330 ms. In those frames the title's render thread waits for its own
+  jobs, not for the layer. One of those jobs is the title's page-mapping
+  copies (`CopyPageMappingsBatchX` -> `xmem::map_alias`): the title maps
+  every streamed texture page into its tiled heap, a range of one page
+  each (over 4,096 different pool pages in a minute, about 850 pages in
+  a frame that streams), and each is a view taken away and a view mapped
+  in the kernel: 32 ms of every cutscene frame, 246 ms of a streaming
+  frame, nearly all of it waiting on the process's address space.
+- Two attempts on that, both taken back out: leaving alone pages that
+  already show what is asked (counted: there are none, every remap is a
+  real change), and mapping pool pages in a row as one view (1.8 to 4.2
+  pages a view, remap time 140 -> 79 ms a frame, BUT faces came out black
+  or red and one run drew garbage in 3 launches of 3, against none in 6
+  launches without it). Reverted; why a longer view breaks texture
+  streaming is not known yet.
+- Measured and found to give nothing (switches left in, off):
+  `VICTORY_REFRESH_ONCE`, `VICTORY_ASYNC_PRESENT`, `VICTORY_VIEW_KNOWN`,
+  `VICTORY_SPREAD`, `VICTORY_QUEUE2=3`, `VICTORY_WINDOW_JUMP`. Each has an
+  `=alt` form (twenty seconds on, twenty off, each change said in the
+  log) so that one run measures both in the same scene.
+
 **Update, the same night: the first room now renders right on the test
 machine** (walls, textures, people, lamps), at 190 to 450 ms a frame (2 to 5
 frames a second): the picture work has caught up, the frame rate has not.
@@ -133,9 +224,15 @@ What did it, on top of the list below:
     frame (`VICTORY_CAPTURE_WORLD`, every 8th world frame) is read back
     and written as a PNG inside the present, 235 ms each.
     `VICTORY_CAPTURE_WORLD_EVERY=64` for runs that measure speed.
-  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments:
-    6.0 -> 8.9 frames a second on average in the first room, 3.1 -> 4.2
-    in the opening cutscene.
+  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments. A
+    CORRECTION: the first figures given here (6.0 against 8.9 frames a
+    second) compared two runs that stood in different scenes during the
+    measured window (about 4,300 against 1,550 draws a frame) and are
+    withdrawn. Compared at equal draws, by a line fitted to each run's
+    frame times against its draws per frame: windows off 145 ms at 4,500
+    draws and 271 ms at 10,000; windows on with `VICTORY_COPY_PLAIN=1`
+    124 ms and 211 ms. On screen: 7-8 frames a second in the first rooms,
+    10-12 in their lighter views.
   - A driver watch (on by default; `VICTORY_DRIVER_WATCH=0` off): the
     layer subscribes to the system's event log and logs every entry of a
     display driver as it is recorded; the first one turns draw windows
@@ -150,10 +247,22 @@ What did it, on top of the list below:
     sync looks at a changed page's records under one lock, fingerprint
     first; guarded view memory is left out of a submission's write-watch
     askings ahead (after triippywhale).
-  - Behind switches, built and unit-tested, not yet shown to pay:
-    `VICTORY_COPY_PLAIN=1` (copies of title memory made in place by this
+  - `VICTORY_COPY_PLAIN=1`: copies of title memory made in place by this
     process, with a handler that falls back to the kernel's copy on a
-    missing page), `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
+    missing page. Its first form also took the layer's one-byte "is this
+    page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
+    reads under 256 bytes now stay with the kernel and a source that
+    faulted is left alone for two seconds (4 to 9 faults a frame). The
+    submit thread's kernel time fell from 44 to 20 ms a frame; the
+    picture is the same.
+  - The layer's submit and copy-back threads ask for the fast cores of a
+    hybrid processor (`VICTORY_FAST_CORES=0`: not): the submit thread was
+    found on a slow core in 6 % of its looks, now in none of 21,059.
+    `VICTORY_DISK_CORES=slow` (off, not measured) asks the slow cores for
+    the DirectStorage workers, which are as many as the logical
+    processors and free to run anywhere.
+  - Behind switches, built and unit-tested, not yet shown to pay:
+    `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
     `VICTORY_BACK_OWN_VIEW=1` (picture to be checked),
     `VICTORY_ASYNC_PRESENT=1` (the present goes behind the queue's line;
     no gain while the card is the limit).
@@ -168,6 +277,12 @@ What did it, on top of the list below:
   Still open: the per-record clamp is most of the card's time, and the
   copies between the PC's memory and the card's are most of the submit
   thread's; the cause of the one device loss with windows is not known.
+  A first play session past the first rooms reached the open world and
+  lost the device there with no driver entry (reason "device removed"):
+  the card had no room for new textures from the opening cutscene on
+  (9.2 of a 10.3 GB budget on a 12 GB card; 2,073 passes made no texture
+  for lack of room; 44,613 textures let go and made again in 13 minutes).
+  Cause of that removal not known either.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
@@ -223,10 +338,6 @@ Rendering:
 - Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
 - Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
 - Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
-- Shader translation over the title's whole shader pack, RTX 5090 (32-lane waves), `victory translate --validate --pipelines`: 25,682 of 25,953 programs translate, validate and get a pipeline, against 25,452 at 9376fd6 (compute 2,729 of 2,734, mesh 8,694 of 8,765, pixel all 12,067, vertex all 2,192). What is left: the 195 unused voxel geometry stages, five ray-trace programs, and 71 mesh programs as translated alone (linked for their pipelines, below).
-- Console wave64 compute programs on a GPU with 32-lane waves run in a paired form where the host refused them (they asked for 64-lane waves) or where only an approximate per-half form took them: one host wave for each console wave, each thread two of its lanes. The screen-space tracing tiles, particles, decal trails, hair shadow masks and three structure-builder programs get pipelines, and 36 programs in which each half-wave counted, ORed or elected over its own 32 lanes run as on the console, at about 2.9 times their DXIL size (not timed in a run yet). `VICTORY_WAVE_PAIRS=0` turns it off.
-- Mesh programs whose outputs pass D3D12's 32 KiB as translated alone (71: pedestrian, vehicle and prop transforms) are linked with the pixel program of each pipeline, so that the mesh program writes only what that program reads (`VICTORY_MESH_LINK=0` turns it off). Offline, 710 such pairs link, validate and get a pipeline.
-- Also translated now: a float beside an integer or the front face in one signature register (one interpolation mode per register, rows in the validator's order), immediate samplers chosen by a uniform branch, pixel programs ordered by primitive (on rasterizer-ordered views), whole-wave sections that a jump splits, 64-bit floats and their wave sums, descriptors read only for their size, a subtraction on group-shared memory (NVIDIA refuses the atomic; a compare-exchange loop). Loops of ray-testing programs stop at 1,024 iterations while the builder is off (shadow mask 11.7 → 2.4 ms a frame).
 
 Speed and memory:
 - Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
@@ -294,7 +405,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard and mouse as a pad (rebindable) | Trigger rumble; keyboard prompts |
+| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
@@ -331,29 +442,17 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads, and keyboard and mouse played like a PC game. The title
-reads pads only, so the keyboard and mouse act on the first connected pad (or
-a stand-in pad when none is): both work at once, each stick follows whichever
-moved it last. The mouse turns the camera through the right stick, its motion
-turned into a rate at each read of the title so the same movement turns the
-same angle at any frame rate. While the window has focus the cursor is hidden
-and held in it; Alt-Tab or Esc frees it, a click or Esc captures it again.
+Input: XInput pads. With none connected the keyboard is a pad while the
+title's window has focus:
 
-| Keys (on foot) | Pad | Keys (in a vehicle) | Pad |
-|------|-----|------|-----|
-| W A S D, Left Alt | left stick, walk | W / S, A D | RT / LT, steer |
-| mouse, left / right button | right stick, RT / LT | Space, E | RB, LS |
-| Left Shift, Space, F, R | A, X, Y, B | F, G | Y + vehicle layout off, layout only |
-| Q, E, Left Ctrl, C | RB, D-pad right, LS, RS | | |
-| Tab, V or M, wheel | LB, View, D-pad left / right | | |
-| arrows, Enter, Backspace, Esc or P | D-pad, A, B, Menu | | |
-
-The letters are the keys at those places on a US keyboard, so the left stick
-is Z Q S D on an AZERTY keyboard (`keys_by_position = false`: by letter).
-F (enter a vehicle) also switches to the vehicle layout and back; G switches
-it alone when it is out of step. Rebind everything in `[controls]` of
-`victory.toml` (see `victory.example.toml`); `enabled = false` brings back the
-old fixed stand-in pad (W A S D / I J K L sticks, Enter, Backspace, X, Y).
+| Keys | Pad |
+|------|-----|
+| W A S D / I J K L | left / right stick |
+| arrows | D-pad |
+| Enter, Backspace, X, Y | A, B, X, Y |
+| Q / E, Z / C | shoulders, triggers |
+| F / H | stick clicks |
+| Esc, Tab | Menu, View |
 
 ## Commands
 
@@ -391,13 +490,11 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_EARLY_PIPELINES=0` | start a host pipeline when a draw or dispatch first requests it. Keeps the learned list, shader cache, and driver pipeline library for comparing startup scheduling across runs |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_MESH_LINK=0` | a mesh pipeline whose mesh program's outputs pass 32 KiB is made of the shared translations, as before, not of the pair linked for it |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
