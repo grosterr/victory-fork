@@ -3377,6 +3377,82 @@ fn wide_merge() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
 }
 
+/// The compare and the CPU scan both cut pieces at 64 KiB boundaries of
+/// title memory. Two declarations can clip the same page differently, or
+/// reach it through buffers with different bases. Keep their landing order.
+fn relay_merge_bucket(start: u64, offset: usize, bytes: usize) -> usize {
+    let address = start as usize + offset;
+    let page = address / crate::watch::PAGE;
+    debug_assert!(bytes > 0 && (address + (bytes - 1)) / crate::watch::PAGE == page);
+    page % MERGE_BUCKETS
+}
+
+const MERGE_BUCKETS: usize = 8;
+
+/// The CPU relay takes whole spans per worker. Aliased spans in one
+/// landing keep their original order on the landing thread.
+fn separate_ranges(ranges: impl Iterator<Item = (usize, usize)>) -> bool {
+    let mut ranges: Vec<_> = ranges.filter(|(lo, hi)| lo < hi).collect();
+    ranges.sort_unstable();
+    ranges.windows(2).all(|pair| pair[0].1 <= pair[1].0) && !crate::inplace::touches_aliased_page(ranges.into_iter())
+}
+
+#[cfg(test)]
+mod relay_bucket_tests {
+    use super::{relay_merge_bucket, separate_ranges};
+    use crate::watch::PAGE;
+
+    #[test]
+    fn adjacent_cpu_spans_can_land_together() {
+        assert!(separate_ranges([(9, 12), (2, 9), (7, 7)].into_iter()));
+        assert!(!separate_ranges([(2, 10), (4, 7)].into_iter()));
+    }
+
+    /// Two different virtual ranges can still update the same byte.
+    #[test]
+    fn two_views_of_one_page_take_the_ordered_landing() {
+        use windows_sys::Win32::{Foundation, System::Memory as mem};
+        // SAFETY: both views are of the test's own committed anonymous section.
+        unsafe {
+            let section = mem::CreateFileMappingW(Foundation::INVALID_HANDLE_VALUE, std::ptr::null(),
+                mem::PAGE_READWRITE, 0, (2 * PAGE) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let first = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, 2 * PAGE);
+            let other = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, PAGE);
+            assert!(!first.Value.is_null() && !other.Value.is_null());
+            let (a, b) = (first.Value as usize, other.Value as usize);
+            crate::inplace::title_memory_view(a, 2 * PAGE, section as usize, 0);
+            crate::inplace::title_memory_view(b, PAGE, section as usize, 0);
+            let writes = [(a + 7, a + 12), (b + 9, b + 11)];
+            let parallel = separate_ranges(writes.into_iter());
+            let second_page = crate::inplace::touches_aliased_page([(a + PAGE, a + PAGE + 1)].into_iter());
+            for ((lo, hi), byte) in writes.into_iter().zip([1u8, 2]) {
+                std::ptr::write_bytes(lo as *mut u8, byte, hi - lo);
+            }
+            let result = std::slice::from_raw_parts((a + 7) as *const u8, 5).to_vec();
+            crate::inplace::views_gone(b, PAGE);
+            let after_unmap = crate::inplace::touches_aliased_page([(a, a + 1)].into_iter());
+            crate::inplace::views_gone(a, 2 * PAGE);
+            mem::UnmapViewOfFile(other);
+            mem::UnmapViewOfFile(first);
+            Foundation::CloseHandle(section);
+            assert!(!parallel && !second_page && !after_unmap);
+            assert_eq!(result, [1, 1, 2, 2, 1]);
+        }
+    }
+
+    #[test]
+    fn clipped_and_aliasing_copies_land_in_page_order() {
+        let base = 0x1234usize;
+        let wide = relay_merge_bucket(base as u64, PAGE - base, PAGE);
+        // Overlaps the end of the wide piece; its offset crosses PAGE
+        // relative to this unaligned buffer, but stays in the same title page.
+        assert_eq!(wide, relay_merge_bucket(base as u64, PAGE, 256));
+        assert_eq!(wide, relay_merge_bucket((PAGE + 128) as u64, 7, 64));
+        assert_ne!(wide, relay_merge_bucket(base as u64, 2 * PAGE - base, 1));
+    }
+}
+
 /// One declared range of a copy in the card's memory, in a submission.
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -5329,6 +5405,39 @@ fn relay_hand_back(back: &[Declared]) {
     let found = crate::shadow::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
+    if wide_merge() && work.len() >= 8 && separate_ranges(work.iter().map(|(_, from, to)| (*from, *to))) {
+        // The spans of a copy are apart from one another, so several copies
+        // at a time; every span of one copy shares a bucket and merges in
+        // order.
+        const BUCKETS: usize = 8;
+        let mut buckets: [Vec<((std::sync::Arc<crate::shadow::Shadow>, usize, usize), Vec<(usize, usize)>)>; BUCKETS] =
+            std::array::from_fn(|_| Vec::new());
+        for (piece, found) in work.into_iter().zip(found) {
+            let key = (std::sync::Arc::as_ptr(&piece.0) as usize >> 6) % BUCKETS;
+            buckets[key].push((piece, found));
+        }
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+            .into_iter()
+            .filter(|bucket| !bucket.is_empty())
+            .map(|bucket| {
+                Box::new(move || {
+                    let (mut now, mut title) = (Vec::new(), Vec::new());
+                    for ((shadow, from, to), found) in bucket {
+                        let mut written = 0;
+                        for (at, n) in found {
+                            written += shadow.relay_merge(at, n, &mut now, &mut title);
+                        }
+                        copy_back(1, written as u64);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::compared(from, to - from, written);
+                        let _ = (from, to);
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        return;
+    }
     let (mut now, mut title) = (Vec::new(), Vec::new());
     for ((shadow, from, to), found) in work.iter().zip(found) {
         let mut written = 0;
@@ -7072,16 +7181,54 @@ impl Host {
                 }
             }
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        let written = if wide_merge() && pieces.len() >= 8 && !crate::inplace::touches_aliased_page(
+            pieces.iter().map(|(shadow, lo, hi, _)| {
+                let start = shadow.span().0 as usize;
+                (start + lo, start + hi)
+            }),
+        ) {
+            let mut buckets: [Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)>; MERGE_BUCKETS] =
+                std::array::from_fn(|_| Vec::new());
+            for (shadow, lo, hi, at) in pieces {
+                let key = relay_merge_bucket(shadow.span().0, lo, hi - lo);
+                buckets[key].push((shadow, lo, hi, at));
+            }
+            let total_written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|bucket| !bucket.is_empty())
+                .map(|bucket| {
+                    let total_written = total_written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut w = 0usize;
+                        for (shadow, lo, hi, at) in bucket {
+                            // SAFETY: the mapping of the fetched bytes,
+                            // `total` of them; the copy into it has run.
+                            let gpu = unsafe { std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo) };
+                            let merged = shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            shadow.walls_merged(gpu.len(), merged);
+                            w += merged;
+                        }
+                        total_written.fetch_add(w, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            total_written.load(Ordering::Relaxed)
+        } else {
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            written
+        };
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are
@@ -7216,15 +7363,56 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
-        }
+        let piece_count = pieces.len();
+        let (written, bytes) = if wide_merge() && piece_count >= 8 && !crate::inplace::touches_aliased_page(
+            pieces.iter().map(|(shadow, lo, hi, _, _)| {
+                let start = shadow.span().0 as usize;
+                (start + lo, start + hi)
+            }),
+        ) {
+            let mut buckets: [Vec<Piece>; MERGE_BUCKETS] = std::array::from_fn(|_| Vec::new());
+            for (shadow, lo, hi, at, after) in pieces {
+                let key = relay_merge_bucket(shadow.span().0, lo, hi - lo);
+                buckets[key].push((shadow, lo, hi, at, after));
+            }
+            let total_written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let total_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|bucket| !bucket.is_empty())
+                .map(|bucket| {
+                    let total_written = total_written.clone();
+                    let total_bytes = total_bytes.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let (mut w, mut b) = (0usize, 0u64);
+                        for (shadow, lo, hi, at, after) in bucket {
+                            // SAFETY: inside the mapping of the slots
+                            // (checked above); the copy into it ran in the
+                            // plan's flight, which the card has run.
+                            let gpu = unsafe { std::slice::from_raw_parts(at as *const u8, hi - lo) };
+                            w += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                            b += (hi - lo) as u64;
+                        }
+                        total_written.fetch_add(w, Ordering::Relaxed);
+                        total_bytes.fetch_add(b, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            (total_written.load(Ordering::Relaxed), total_bytes.load(Ordering::Relaxed))
+        } else {
+            let mut title = Vec::new();
+            let (mut written, mut bytes) = (0, 0u64);
+            for (shadow, lo, hi, at, after) in &pieces {
+                // SAFETY: inside the mapping of the slots (checked above); the
+                // copy into it ran in the plan's flight, which the card has run.
+                let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
+                bytes += (hi - lo) as u64;
+            }
+            (written, bytes)
+        };
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -7232,7 +7420,7 @@ impl Host {
             }
         }
         copy_back(1, written as u64);
-        INFLIGHT_STATS[0].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        INFLIGHT_STATS[0].fetch_add(piece_count as u64, Ordering::Relaxed);
         INFLIGHT_STATS[1].fetch_add(bytes, Ordering::Relaxed);
         // The next merge is of a later plan, or a fetch the old way sent now.
         if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
@@ -7478,7 +7666,10 @@ impl Host {
                     }
                 }
             }
-            if wide_merge() && pieces.len() >= 8 {
+            if wide_merge() && pieces.len() >= 8 && separate_ranges(pieces.iter().map(|&(i, lo, hi, _)| {
+                let start = plan.ranges[i].shadow.span().0 as usize;
+                (start + lo, start + hi)
+            })) {
                 // The pieces are apart from one another (each its own bytes
                 // of its copy and of title memory): several at a time.
                 let fetched = *data;
