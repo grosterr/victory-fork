@@ -3443,7 +3443,9 @@ impl Shadow {
                 // (`back_run_gap`).
                 join_runs(&mut runs, back_run_gap());
                 for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    if !self.put_back_quiet(start + at + off, &title[off..off + len]) {
+                        crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                    }
                     written += len;
                 }
             }
@@ -3549,6 +3551,11 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
+        if self.put_back_quiet(start + at, &title[..]) {
+            #[cfg(feature = "diagnostics")]
+            crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
+            return n;
+        }
         if self.put_back_own(start + at, &title[..]) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
@@ -3560,6 +3567,66 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
         n
+    }
+
+    /// With `VICTORY_BACK_QUIET=1`: what a merge made of private,
+    /// write-watched title memory `[at, at + bytes.len())` is written as
+    /// before, then the kernel's write-watch bits of those pages are reset,
+    /// so the write does not read as the title's; the journal is told the
+    /// pages changed (as [`Self::put_back_own`] does for view memory), so
+    /// every other copy that holds them takes them again, and this copy,
+    /// which holds them already, notes itself current instead of taking
+    /// its own output in again. The read census on the fork (#1169) found
+    /// about 92% of the layer's touches of copied-back pages were that.
+    /// False with nothing written if the switch is off, the pages are not
+    /// write-watched, or the title wrote one of them since the last asking
+    /// (its bit would be reset too): the caller writes as before.
+    /// shortcut: a title write to one of the pages between the write and
+    /// the reset is lost to the write-watch.
+    fn put_back_quiet(&self, at: usize, bytes: &[u8]) -> bool {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, ResetWriteWatch};
+        if !quiet_back() || bytes.is_empty() {
+            return false;
+        }
+        let first = at & !4095;
+        let end = (at + bytes.len()).next_multiple_of(4096);
+        let mut found = [std::ptr::null_mut::<std::ffi::c_void>(); 32];
+        let mut count = found.len();
+        let mut granularity = 0u32;
+        // SAFETY: a query of title memory into arrays of ours.
+        let asked = unsafe {
+            GetWriteWatch(0, first as _, end - first, found.as_mut_ptr(), &mut count, &mut granularity)
+        };
+        if asked != 0 || count != 0 {
+            QUIET[1].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        crate::watch::writing(at, bytes.len());
+        crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len());
+        // SAFETY: the same write-watched pages.
+        unsafe { ResetWriteWatch(first as _, end - first) };
+        crate::descriptor::host::remapped(at, bytes.len());
+        let base = self.start as usize / PAGE;
+        for page in at / PAGE..(at + bytes.len()).div_ceil(PAGE) {
+            let (before, now) = crate::watch::wrote_own(page, &[]);
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                && *taken != 0
+                && *taken >= before
+            {
+                *taken = (*taken).max(now);
+            }
+        }
+        QUIET[0].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let n = QUIET[2].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(16384) {
+            tracing::info!(
+                "copy-backs written quietly (VICTORY_BACK_QUIET=1) since the start: {n} stretches {} MB; written the old way (not write-watched, or the title had written there): {}",
+                QUIET[0].load(Ordering::Relaxed) >> 20,
+                QUIET[1].load(Ordering::Relaxed)
+            );
+        }
+        true
     }
 
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
@@ -4630,9 +4697,11 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
-                crate::watch::writing(start + at, n);
-                merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                if !self.put_back_quiet(start + at, &title[..]) {
+                    crate::watch::writing(start + at, n);
+                    merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
+                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                }
                 written = n;
             }
         } else {
@@ -4725,6 +4794,11 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
+        if self.put_back_quiet(start + at, &title[..]) {
+            #[cfg(feature = "diagnostics")]
+            crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
+            return n;
+        }
         if self.put_back_own(start + at, &title[..]) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
@@ -5300,6 +5374,16 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// together with `VICTORY_WINDOW_KB` below 4096: on the 4 MiB grid an ask
 /// with a length in the same cell makes the whole cell's window, and the
 /// tail is that.
+/// `VICTORY_BACK_QUIET=1`: see [`Shadow::put_back_quiet`]. Off by default.
+fn quiet_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_QUIET").is_some_and(|v| v == "1"))
+}
+
+/// Quiet copy-backs since the start: bytes, stretches written the old way,
+/// stretches written quietly.
+static QUIET: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
