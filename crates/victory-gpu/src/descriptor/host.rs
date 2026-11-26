@@ -112,7 +112,7 @@ pub(crate) struct HostHeap {
     kept_one: Mutex<()>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, Taken)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1138,6 +1138,101 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
+/// Which dynamic slots are taken, a bit each, searched a word at a time.
+///
+/// Why: a slot at a time, a table that found no run walked the whole ring
+/// under the lock every recording thread needs: on a host whose view heaps
+/// stop at [`PORTABLE_VIEWS`] (NVIDIA: 2^18 dynamic slots), a frame that
+/// refused 2,200 tables searched for 558 ms of its recording threads' time
+/// (RTX 3080).
+pub(crate) struct Taken {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl Taken {
+    fn new(len: usize) -> Self {
+        Self { words: vec![0; len.div_ceil(64)], len }
+    }
+
+    /// Whether slot `at` is taken; `None` past the end.
+    #[cfg(test)]
+    fn get(&self, at: usize) -> Option<bool> {
+        (at < self.len).then(|| self.words[at / 64] >> (at % 64) & 1 != 0)
+    }
+
+    /// The first of `n` free slots in a row within `[from, to)`.
+    fn find(&self, from: usize, to: usize, n: usize) -> Option<usize> {
+        let to = to.min(self.len);
+        let mut run = 0usize;
+        let mut at = from;
+        while at < to {
+            let bit = at % 64;
+            let span = (64 - bit).min(to - at);
+            let mask = if span == 64 { u64::MAX } else { (1u64 << span) - 1 };
+            let word = (self.words[at / 64] >> bit) & mask;
+            if word == 0 {
+                run += span;
+                if run >= n {
+                    return Some(at + span - run);
+                }
+                at += span;
+            } else if word == mask {
+                run = 0;
+                at += span;
+            } else {
+                // Free slots up to the first taken one, then past the taken
+                // ones (the bits above `span` are clear in `word`).
+                let free = word.trailing_zeros() as usize;
+                run += free;
+                if run >= n {
+                    return Some(at + free - run);
+                }
+                let held = (!(word >> free)).trailing_zeros() as usize;
+                run = 0;
+                at += free + held;
+            }
+        }
+        None
+    }
+
+    /// Marks `[from, to)` taken or free; how many changed.
+    fn set(&mut self, from: usize, to: usize, taken: bool) -> usize {
+        let to = to.min(self.len);
+        let mut changed = 0;
+        let mut at = from;
+        while at < to {
+            let bit = at % 64;
+            let span = (64 - bit).min(to - at);
+            let mask = (if span == 64 { u64::MAX } else { (1u64 << span) - 1 }) << bit;
+            let word = &mut self.words[at / 64];
+            if taken {
+                changed += (!*word & mask).count_ones() as usize;
+                *word |= mask;
+            } else {
+                changed += (*word & mask).count_ones() as usize;
+                *word &= !mask;
+            }
+            at += span;
+        }
+        changed
+    }
+
+    /// The longest run of free slots (for the log of a failed search).
+    fn longest_free(&self) -> usize {
+        let (mut best, mut run) = (0, 0);
+        for at in 0..self.len {
+            if self.words[at / 64] >> (at % 64) & 1 != 0 {
+                run = 0;
+            } else {
+                run += 1;
+                best = best.max(run);
+            }
+        }
+        best
+    }
+}
+
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
@@ -1312,7 +1407,7 @@ impl HostHeap {
                 .map(|_| Mutex::new(vec![None; (count + extra).div_ceil(KEPT_PIECES) as usize]))
                 .collect(),
             kept_one: Mutex::new(()),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            next: Mutex::new((0, Taken::new(DYNAMIC as usize))),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1434,27 +1529,17 @@ impl HostHeap {
         // it, and `too_long` then refused every table as long until the
         // next release.
         let (cursor, end) = (*next as usize, self.dynamic as usize);
-        let starts = (cursor..end).chain(0..(cursor + n - 1).min(end));
-        let mut run = 0;
+        // (A run cannot wrap past the end: the two parts are searched apart.)
         let mut found = None;
-        let mut last = usize::MAX;
-        for (step, at) in starts.enumerate().take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
+        if enough {
+            found = taken.find(cursor, end, n);
+            if found.is_none() {
+                found = taken.find(0, (cursor + n - 1).min(end), n);
                 // Past `next` in the second part: a run across it.
                 #[cfg(feature = "diagnostics")]
-                if step >= end {
+                if found.is_some_and(|first| first + n > cursor) {
                     DYNAMIC_WHY[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                #[cfg(not(feature = "diagnostics"))]
-                let _ = step;
-                break;
             }
         }
         let Some(first) = found else {
@@ -1482,7 +1567,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.set(first, first + n, true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % DYNAMIC as usize) as u32;
         Some(self.count + first as u32)
@@ -2349,11 +2434,10 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        if (at as usize) < end {
+            let given = guard.1.set(at as usize, end, false) as u32;
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -5605,6 +5689,41 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.dynamic(6), Some(4 + 10));
         // And nothing is found where nothing is.
         assert_eq!(heap.dynamic(1), None);
+    }
+
+    #[test]
+    fn taken_finds_runs_a_word_at_a_time_as_a_slot_at_a_time() {
+        // Against the slot-at-a-time search, on patterns across word ends.
+        let len = 300;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..400 {
+            let mut taken = Taken::new(len);
+            let mut plain = vec![false; len];
+            for _ in 0..(round % 40) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let from = (seed % len as u64) as usize;
+                let to = (from + (seed >> 32) as usize % 90).min(len);
+                let on = seed & 1 == 0;
+                let changed = plain[from..to].iter().filter(|&&t| t != on).count();
+                assert_eq!(taken.set(from, to, on), changed);
+                plain[from..to].fill(on);
+            }
+            for at in 0..len {
+                assert_eq!(taken.get(at), Some(plain[at]));
+            }
+            let longest = plain.split(|&t| t).map(<[bool]>::len).max().unwrap_or(0);
+            assert_eq!(taken.longest_free(), longest);
+            for (from, to) in [(0, len), (37, len), (64, 200), (5, 6), (130, 129)] {
+                for n in [1, 2, 63, 64, 65, 128, 200] {
+                    let want = (from..to.max(from))
+                        .filter(|&s| s + n <= to)
+                        .find(|&s| plain[s..s + n].iter().all(|&t| !t));
+                    assert_eq!(taken.find(from, to, n), want, "round {round} [{from}, {to}) n {n}");
+                }
+            }
+        }
     }
 
     #[test]
