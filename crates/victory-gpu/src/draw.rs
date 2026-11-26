@@ -4294,7 +4294,13 @@ impl State {
             .flatten()
             .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
         let is_spread = spread.is_some();
-        let Some(signature) = spread.or_else(|| {
+        let lean_spread = is_spread && max > 0 && spread_lean_on();
+        let plain_sig = lean_spread.then(|| host_signature(DISPATCH, 12)).flatten();
+        if lean_spread && plain_sig.is_none() {
+            why("no host plain dispatch signature");
+            return false;
+        }
+        let Some(signature) = spread.clone().or_else(|| {
             matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
                 .then(|| host_signature(kind, stride))
                 .flatten()
@@ -4367,7 +4373,7 @@ impl State {
         } else {
             None
         };
-        let (bounded, at) = match (hit, gathered) {
+        let (bounded, at, lean_offsets) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
@@ -4391,7 +4397,7 @@ impl State {
                         self.walk_step = Some((w.copy, w.kind, w.stride, w.step));
                     }
                 }
-                (scratch, at)
+                (scratch, at, None)
             }
             (None, Some((scratch, at))) => {
                 // The record's bytes are up to date when the list is
@@ -4403,7 +4409,7 @@ impl State {
                     self.host_pipeline = 0;
                     self.host_roots[1] = 0;
                 }
-                (scratch, at)
+                (scratch, at, None)
             }
             (None, None) => {
                 // A window opened at the remembered step that no draw read
@@ -4461,17 +4467,40 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                let (bounded, lean_offsets) = if windowed && records > 1 {
+                    match crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records)) {
+                        Some(b) => (b, None),
+                        None => {
+                            self.window = None;
+                            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                            return false;
+                        }
+                    }
+                } else if lean_spread {
+                    match crate::indirect::bound_spread_lean(
+                        list,
+                        (&args.buffer, offset),
+                        count_arg,
+                        (kind, step, records),
+                    ) {
+                        Some((b, pred_off, spread_off)) => (b, Some((pred_off, spread_off))),
+                        None => {
+                            self.window = None;
+                            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                            return false;
+                        }
+                    }
                 } else {
                     // (A spread dispatch is never windowed: `windowed` is
                     // false for dispatches.)
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
-                };
-                let Some(bounded) = bounded else {
-                    self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
+                    match crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread) {
+                        Some(b) => (b, None),
+                        None => {
+                            self.window = None;
+                            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                            return false;
+                        }
+                    }
                 };
                 #[cfg(feature = "diagnostics")]
                 if why_not < WINDOW_WHY.len() {
@@ -4509,7 +4538,7 @@ impl State {
                     records,
                     scratch: bounded.clone(),
                 });
-                (bounded, 0)
+                (bounded, 0, lean_offsets)
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -4533,18 +4562,50 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        if let (Some(plain_sig), Some(spread_sig), Some((pred_off, spread_off))) =
+            (plain_sig, spread, lean_offsets)
+        {
+            // SAFETY: an open list with compute state set; `bounded` is in
+            // `INDIRECT_ARGUMENT | PREDICATION`, `plain_sig` runs `<= 65,535`
+            // records at offset 0, `SetPredication` skips `spread_sig` when
+            // `pred_off == 0`, and `spread_sig` runs `> 65,535` records at
+            // `spread_off` with their root constants.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &plain_sig,
+                    max,
+                    &bounded,
+                    0,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+                list.list
+                    .SetPredication(Some(&bounded), pred_off, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                list.list.ExecuteIndirect(
+                    &spread_sig,
+                    max,
+                    &bounded,
+                    spread_off,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+                list.list
+                    .SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
+        } else {
+            // SAFETY: an open list with everything set; the scratch buffer and
+            // host copies are kept alive by the list, and the signature is cached.
+            unsafe {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                )
+            };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4555,6 +4616,9 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if is_spread {
                 SPREAD[1].fetch_add(1, Ordering::Relaxed);
+                if lean_spread {
+                    SPREAD[2].fetch_add(1, Ordering::Relaxed);
+                }
             }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4567,8 +4631,9 @@ impl State {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 /// Dispatches spread across z since the frame line last took them: direct,
-/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
-pub(crate) static SPREAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// indirect, and indirect via `VICTORY_SPREAD_LEAN`
+/// ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
+pub(crate) static SPREAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// The user-data root parameter of compute pipeline `p` whose program takes
 /// the spread words, and the index of the first in it (the second follows:
@@ -4613,6 +4678,34 @@ fn spread_on() -> bool {
                 tracing::info!(
                     "dispatches past 65,535 groups are spread across z from now (VICTORY_DISPATCH_SPREAD=alt): {}",
                     if on { "ON" } else { "off, clamped to 65,535 as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Whether spread-eligible indirect compute dispatches use the lean path
+/// (`VICTORY_SPREAD_LEAN`: off by default; `1` on: run <= 65,535 records with a
+/// plain `DISPATCH` signature and predicate the spread signature out on the
+/// GPU; `alt`: twenty seconds with, twenty without, in turn).
+fn spread_lean_on() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "indirect dispatches past 65,535 groups use the lean path from now (VICTORY_SPREAD_LEAN=alt): {}",
+                    if on { "ON" } else { "off, classic spread signature" }
                 );
             }
             on
