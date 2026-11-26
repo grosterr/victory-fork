@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -91,6 +92,14 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// Warm the run's caches: every container found is translated
+        /// into the run's shader cache; with --pipelines, then every
+        /// pipeline of the title's shader pack is made into the run's host
+        /// pipeline library (the pre-build: the host device is made first,
+        /// and a run with the same environment finds them all). Give the
+        /// game's shaders.rpf and the executables (or the game folder).
+        #[arg(long, conflicts_with = "warm")]
+        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -160,6 +169,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            cache,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -171,6 +181,9 @@ fn main() -> Result<()> {
             }
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
+            }
+            if cache {
+                return translate::cache(paths, jobs, pipelines);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
