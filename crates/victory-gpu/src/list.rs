@@ -200,6 +200,11 @@ impl Detached {
         Detached { host, _uploads: Vec::new(), _state: Default::default() }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_state(host: crate::host::HostList, state: crate::draw::State) -> Self {
+        Self { _state: state, ..Self::ours(host) }
+    }
+
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }

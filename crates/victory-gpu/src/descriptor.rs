@@ -1667,6 +1667,10 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(test, windows))]
+#[path = "descriptor/cbv_bench.rs"]
+mod cbv_bench;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1677,9 +1681,73 @@ mod tests {
     #[repr(C)]
     struct Extended(HeapDesc, Placement);
 
-    fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
+    pub(super) fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    pub(super) type DebugLog = Option<(
+        windows::Win32::Graphics::Direct3D12::ID3D12InfoQueue1,
+        u32,
+        &'static std::sync::atomic::AtomicU32,
+        &'static std::sync::atomic::AtomicU32,
+        &'static std::sync::atomic::AtomicU32,
+    )>;
+
+    #[cfg(windows)]
+    pub(super) fn test_debug(device: &crate::host::Host) -> DebugLog {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            let info: ID3D12InfoQueue1 = device.device().cast().expect("debug layer");
+            struct Log {
+                errors: std::sync::atomic::AtomicU32,
+                warnings: std::sync::atomic::AtomicU32,
+                heap_limit: std::sync::atomic::AtomicU32,
+            }
+            static LOG: Log = Log { errors: std::sync::atomic::AtomicU32::new(0), warnings: std::sync::atomic::AtomicU32::new(0), heap_limit: std::sync::atomic::AtomicU32::new(0) };
+            unsafe extern "system" fn log(
+                _: D3D12_MESSAGE_CATEGORY,
+                severity: D3D12_MESSAGE_SEVERITY,
+                id: D3D12_MESSAGE_ID,
+                message: windows::core::PCSTR,
+                _: *mut std::ffi::c_void,
+            ) {
+                use std::sync::atomic::Ordering::Relaxed;
+                if severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                    let counter = if id.0 == 645 { &LOG.heap_limit } else if severity == D3D12_MESSAGE_SEVERITY_WARNING {
+                        &LOG.warnings
+                    } else {
+                        &LOG.errors
+                    };
+                    counter.fetch_add(1, Relaxed);
+                    // SAFETY: D3D12 passes a live NUL-terminated message.
+                    eprintln!("D3D12 {}: {}", id.0, unsafe { message.to_string() }.unwrap());
+                }
+            }
+            let mut cookie = 0;
+            // SAFETY: static callback and counters.
+            unsafe { info.RegisterMessageCallback(Some(log), D3D12_MESSAGE_CALLBACK_IGNORE_FILTERS, std::ptr::null_mut(), &mut cookie) }.unwrap();
+            host::probe_view_limit();
+            let probe_count = LOG.heap_limit.swap(0, std::sync::atomic::Ordering::Relaxed);
+            assert!(probe_count <= 1);
+            eprintln!("upstream shader-visible heap size probe: {probe_count} message(s) 645");
+            Some((info, cookie, &LOG.errors, &LOG.warnings, &LOG.heap_limit))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn check_debug(debug: DebugLog) {
+        if let Some((info, cookie, errors, warnings, heap_limit)) = debug {
+            use std::sync::atomic::Ordering::Relaxed;
+            // SAFETY: the callback with this cookie belongs to this test.
+            unsafe { info.UnregisterMessageCallback(cookie) }.unwrap();
+            eprintln!("D3D12: {} warnings, {} errors", warnings.load(Relaxed), errors.load(Relaxed));
+            assert_eq!(errors.load(Relaxed) + heap_limit.load(Relaxed), 0);
+        }
     }
 
     #[cfg(windows)]

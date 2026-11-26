@@ -560,7 +560,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, Option<u64>)>,
     /// The dynamic slots the list holds: title heap, that heap's identity
     /// (`HostHeap::id`), first, count; given back when the list has run, is
     /// reset or released.
@@ -1424,6 +1424,8 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        // AscilCH #742: only scratch-backed tables expire at a cut.
+        self.fresh_tables.retain(|_, (_, epoch)| epoch.is_none());
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -3894,6 +3896,7 @@ impl State {
             }
         }
         let mut made = Vec::new();
+        let cbv_epoch = (!fresh.is_empty()).then(|| list.cbv_epoch());
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -3981,7 +3984,9 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             tally(0, 1);
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(&(first, epoch)) = self.fresh_tables.get(&key)
+                && (epoch.is_none() || epoch == cbv_epoch)
+            {
                 #[cfg(feature = "diagnostics")]
                 tally(1, 1);
                 // Found in the table an earlier stage of this draw made
@@ -4035,7 +4040,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             clock.lap(21);
-            self.fresh_tables.insert(key, first);
+            let mut scratch_epoch = None;
             if !spans.is_empty() {
                 staged.push((table, n));
             }
@@ -4051,11 +4056,11 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        scratch_epoch = cbv_epoch;
+                        let Some(gpu) = list.constant_scratch(address, size) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                         #[cfg(feature = "diagnostics")]
                         {
@@ -4113,6 +4118,7 @@ impl State {
                     }
                 }
             }
+            self.fresh_tables.insert(key, (first, scratch_epoch));
             made.push((slot, first * 32));
         }
         #[cfg(feature = "diagnostics")]

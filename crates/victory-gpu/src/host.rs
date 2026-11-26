@@ -3463,6 +3463,8 @@ struct Deferred {
     /// second fill would find holding the same bytes
     /// ([`HostList::fill_scratch`]).
     filled: std::collections::HashMap<(usize, usize), u64>,
+    cbv_snapshots: std::collections::HashMap<(u64, u32), u64>,
+    cbv_epoch: u64,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -3491,6 +3493,24 @@ struct Deferred {
 }
 
 impl Deferred {
+    fn title_write(&mut self) {
+        self.refreshed.clear();
+        if list_reuse_set() {
+            self.filled.clear();
+        }
+        self.invalidate_cbv_snapshots();
+        self.cbv_epoch += 1;
+    }
+
+    fn invalidate_cbv_snapshots(&mut self) {
+        if self.cbv_snapshots.is_empty() {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        CBV_SNAPSHOTS[3].fetch_add(self.cbv_snapshots.len() as u64, Ordering::Relaxed);
+        self.cbv_snapshots.clear();
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -8631,7 +8651,11 @@ impl HostList {
         let started = std::time::Instant::now();
         self._alive.used();
         *self.clamp_window.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        {
+            let mut deferred = self.deferred();
+            deferred.invalidate_cbv_snapshots();
+            *deferred = Deferred::default();
+        }
         {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
             states.clear();
@@ -9442,6 +9466,44 @@ impl HostList {
         Some(gpu)
     }
 
+    pub(crate) fn cbv_epoch(&self) -> u64 {
+        self.deferred().cbv_epoch
+    }
+
+    // The first fill still participates in the existing prior-flight write checks.
+    pub(crate) fn constant_scratch(&self, address: u64, size: u32) -> Option<u64> {
+        let reuse = reuse_cbv_snapshots() && (256..=65_536).contains(&size) && size.is_multiple_of(256);
+        let key = (address, size);
+        if reuse && let Some(&gpu) = self.deferred().cbv_snapshots.get(&key) {
+            #[cfg(feature = "diagnostics")]
+            {
+                CBV_SNAPSHOTS[0].fetch_add(1, Ordering::Relaxed);
+                CBV_SNAPSHOTS[2].fetch_add(u64::from(size), Ordering::Relaxed);
+            }
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(u64::from(size))?;
+        self.defer_fill(to, address as *const u8, size as usize);
+        if reuse {
+            #[cfg(feature = "diagnostics")]
+            CBV_SNAPSHOTS[1].fetch_add(1, Ordering::Relaxed);
+            let mut deferred = self.deferred();
+            if deferred.cbv_snapshots.len() < 4096 {
+                deferred.cbv_snapshots.insert(key, gpu);
+            }
+        }
+        Some(gpu)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn constant_bench_allocations(&self) -> (usize, usize, usize) {
+        let (fills, bytes) = self.deferred().copies.iter().fold((0, 0), |(fills, bytes), step| {
+            if let Step::Fill(_, _, len) = step { (fills + 1, bytes + len) } else { (fills, bytes) }
+        });
+        let chunks = self.scratch.lock().unwrap_or_else(|e| e.into_inner()).chunks.len();
+        (fills, bytes, chunks)
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -9449,6 +9511,7 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        deferred.title_write();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -9465,10 +9528,6 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
-        if list_reuse_set() {
-            deferred.filled.clear();
-        }
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -9820,11 +9879,13 @@ impl HostList {
     /// (refreshes after it copy again; [`near_writes`] uses the place,
     /// without the switch any write of title memory is assumed).
     pub(crate) fn defer_at(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work), Some((at, len))));
-        self.deferred().refreshed.clear();
-        if list_reuse_set() {
-            self.deferred().filled.clear();
-        }
+        self.defer_title_write(Some((at, len)), work);
+    }
+
+    fn defer_title_write(&self, range: Option<(usize, usize)>, work: impl Fn() + Send + 'static) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work), range));
+        deferred.title_write();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -10430,6 +10491,23 @@ impl Batch {
 fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_some_and(|v| v == "1"))
+}
+
+fn reuse_cbv_snapshots() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_SNAPSHOT_REUSE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+static CBV_SNAPSHOTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cbv_snapshots_line() {
+    if reuse_cbv_snapshots() {
+        let [hits, misses, bytes_avoided, invalidated] =
+            CBV_SNAPSHOTS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+        tracing::info!(hits, misses, bytes_avoided, invalidated, "CBV snapshots since last frame report");
+    }
 }
 
 /// What `VICTORY_LIST_REUSE` says: 0 unset (off), 1 on, 2 in turn.
@@ -12644,5 +12722,47 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod cbv_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn copy_join_title_work_reset_and_pending_gpu_write_preserve_cbv_snapshots() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let mut title = [1u8; 256];
+        let source = [2u8; 256];
+        let ptr = title.as_mut_ptr();
+        let address = ptr as usize;
+        let first = list.constant_scratch(address as u64, 256).unwrap();
+        list.constant_scratch(address as u64, 256).unwrap();
+        assert!(list.deferred().copies.iter().any(|step| {
+            matches!(step, Step::Fill(_, src, 256) if *src == address)
+        }));
+        assert_eq!(
+            blocked_by(&[(address + 4, address + 8)], &[&list], false),
+            if fill_ahead::on() { None } else { Some(WHY_READ) }
+        );
+
+        list.defer_copy(ptr, source.as_ptr(), 128);
+        // SAFETY: second halves of the same live, nonoverlapping ranges.
+        unsafe { list.defer_copy(ptr.add(128), source.as_ptr().add(128), 128) };
+        assert_eq!(list.deferred().copies.iter().filter(|s| matches!(s, Step::Copy(..))).count(),
+            if join_copies() { 1 } else { 2 });
+        assert_eq!(list.cbv_epoch(), 2);
+        let after_copy = list.constant_scratch(address as u64, 256).unwrap();
+        assert_ne!(first, after_copy);
+
+        list.defer_title_write(None, || {});
+        assert_eq!(list.cbv_epoch(), 3);
+        assert_ne!(after_copy, list.constant_scratch(address as u64, 256).unwrap());
+        list.close();
+        list.reset();
+        assert_eq!(list.cbv_epoch(), 0);
+        assert!(list.deferred().cbv_snapshots.is_empty());
+        assert_eq!(list.constant_bench_allocations().0, 0);
     }
 }
