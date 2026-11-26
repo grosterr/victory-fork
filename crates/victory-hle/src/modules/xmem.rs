@@ -497,11 +497,33 @@ fn split_late() -> bool {
 }
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
-// reservations, at more than one address if it likes. Here each allocation
-// is a pagefile-backed section, its pages are 64 KiB slices of it, and a
+// reservations, at more than one address if it likes. Each allocation uses
+// pagefile-backed sections, its pages are 64 KiB slices of them, and a
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+
+/// Keep fewer views under each Windows section lock during remapping
+/// (RyanCase94, fork issue #1089). `VICTORY_SECTION_MB=2` caps a section at 2 MiB;
+/// unset or zero keeps one section per allocation.
+fn section_pages() -> usize {
+    #[cfg(test)]
+    if let Some(pages) = SECTION_PAGES.get() {
+        return pages;
+    }
+    static PAGES: LazyLock<usize> = LazyLock::new(|| {
+        let mb = std::env::var("VICTORY_SECTION_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        if mb == 0 { usize::MAX } else { mb.saturating_mul(MIB / PAGE) }
+    });
+    *PAGES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Pages per section for this thread's allocations, in place of
+    /// `VICTORY_SECTION_MB` (`physical_remap_bench`).
+    static SECTION_PAGES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 
 struct Section(HANDLE);
 
@@ -512,6 +534,7 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        victory_gpu::title_memory_section_closed(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -569,55 +592,62 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+    }
+    let per = section_pages();
+    let committed = on_wine();
+    let mut sections = Vec::new();
+    if sections.try_reserve_exact(n.div_ceil(per)).is_err() {
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
     }
+    for first in (0..n).step_by(per) {
+        let chunk = (n - first).min(per);
+        let size = chunk * PAGE;
+        // SAFETY: a pagefile-backed section. On Windows the pages are committed
+        // on first use. Wine backs a committed section with a sparse file.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if committed { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null. Earlier sections close on drop.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        sections.push((first, chunk, Arc::new(Section(handle))));
+    }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    for (_, chunk, section) in &sections {
+        victory_gpu::title_memory_section(section.0 as usize, (chunk * PAGE) as u64, committed);
+    }
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    for (offset, chunk, section) in sections {
+        for index in 0..chunk {
+            let number = first + (offset + index) * FRAMES;
+            physical.pages.insert(number, Slice { section: section.clone(), index });
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(offset + index).write(number) };
+        }
     }
     1
 }
@@ -762,8 +792,8 @@ impl PageWindow {
 }
 
 /// A window on bytes `[offset, offset + len)` of `pages` when they are
-/// consecutive pages of one allocation (how titles usually hand them out);
-/// `None` otherwise (pages of several allocations, out of order, or
+/// consecutive pages of one section (an allocation may have several);
+/// `None` otherwise (pages of several sections, out of order, or
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
@@ -1751,6 +1781,28 @@ mod tests {
     }
 
     #[test]
+    fn physical_page_numbers_and_writes_continue_across_sections() {
+        let pages = allocate(33);
+        assert!(pages.windows(2).all(|pair| pair[1] == pair[0] + FRAMES));
+        let groups = runs(&pages, 0, pages.len() * PAGE).unwrap();
+        let mb = std::env::var("VICTORY_SECTION_MB").ok().and_then(|v| v.parse::<usize>().ok());
+        let expected: &[usize] = match mb {
+            Some(1) => &[16, 16, 1],
+            Some(2) => &[32, 1],
+            _ => &[33],
+        };
+        assert_eq!(groups.iter().map(|(_, count)| *count).collect::<Vec<_>>(), expected);
+        assert!(groups.iter().all(|(slice, _)| slice.index == 0));
+        // The last byte of a 2 MiB section and the first of the next.
+        let offset = 32 * PAGE - 1;
+        assert_eq!(page_window(&pages, offset, 2).is_none(), expected.len() > 1);
+        assert!(write_physical(&pages, offset, &[17, 29]));
+        assert_eq!(page_bytes(pages[31])[PAGE - 1], 17);
+        assert_eq!(page_bytes(pages[32])[0], 29);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn page_windows_cover_one_run_in_place() {
         let (a, b) = (allocate(3), allocate(1));
         let mut window = page_window(&a, PAGE + 3, PAGE).expect("one run");
@@ -1770,5 +1822,144 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// Remapping single pages of a large allocation while other memory is
+    /// made and freed: one section per allocation against 2 MiB sections
+    /// (#1089). By KainanP (Marvisak/VIctory PR 3177), adapted to
+    /// `VICTORY_SECTION_MB`: the sections are chosen per run here, whatever
+    /// the switch says. Ignored: it maps 4 GiB and runs for about a minute.
+    /// `cargo test --release -p victory-hle physical_remap_bench --
+    /// --ignored --nocapture`; `VICTORY_SECTION_BENCH=<MiB>,<seconds>,
+    /// <rounds>,<pressure MiB>` changes the defaults `4096,10,3,2048`.
+    #[test]
+    #[ignore]
+    fn physical_remap_bench() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// Stops the pressure thread however the timed loop ends, so that a
+        /// failed assertion does not leave the scope waiting for it.
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let knobs: Vec<usize> = std::env::var("VICTORY_SECTION_BENCH")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+        let knob = |i: usize, default: usize| knobs.get(i).copied().unwrap_or(default);
+        let (mib, seconds, rounds, pressure) =
+            (knob(0, 4096), knob(1, 10), knob(2, 3), knob(3, 2048));
+        let n = mib * MIB / PAGE;
+        let percentile = |v: &mut Vec<f64>, p: usize| {
+            v.sort_by(f64::total_cmp);
+            v[(v.len() * p / 100).min(v.len() - 1)]
+        };
+        let name = |mb: usize| {
+            if mb == 0 {
+                "one".to_string()
+            } else {
+                format!("{mb} MiB")
+            }
+        };
+        let mut results: Vec<(usize, Vec<[f64; 5]>)> = vec![(0, vec![]), (2, vec![])];
+        for round in 0..rounds {
+            for (mb, rows) in &mut results {
+                let per = if *mb == 0 { usize::MAX } else { *mb * MIB / PAGE };
+                SECTION_PAGES.set(Some(per));
+                let pages = allocate(n);
+                SECTION_PAGES.set(None);
+                let at = XMemVirtualAlloc(
+                    std::ptr::null_mut(),
+                    n * PAGE,
+                    MEM_RESERVE | PAGES_64K,
+                    0,
+                    PAGE_READWRITE,
+                );
+                assert!(!at.is_null());
+                let base = at as usize;
+                // A view a page, each page touched, as the title maps its pool.
+                for (k, page) in pages.iter().enumerate() {
+                    let page_at = (base + k * PAGE) as *mut c_void;
+                    assert_eq!(XMemMapPhysicalPages(page_at, 1, page), page_at);
+                    for b in (0..PAGE).step_by(4096) {
+                        // SAFETY: mapped read-write just now.
+                        unsafe { page_at.cast::<u8>().byte_add(b).write(1) };
+                    }
+                }
+                let stop = AtomicBool::new(false);
+                let mut calls = Vec::new();
+                std::thread::scope(|scope| {
+                    // Another user of memory: made, touched and freed again.
+                    scope.spawn(|| {
+                        while pressure > 0 && !stop.load(Ordering::Relaxed) {
+                            let mut block = vec![0u8; pressure * MIB];
+                            for b in block.iter_mut().step_by(4096) {
+                                *b = 1;
+                            }
+                            std::hint::black_box(&block);
+                        }
+                    });
+                    let _stop = Stop(&stop);
+                    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+                    let mut next = || {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed as usize % n
+                    };
+                    let start = Instant::now();
+                    while start.elapsed() < Duration::from_secs(seconds as u64) {
+                        let (k, page) = (next(), pages[next()]);
+                        let page_at = (base + k * PAGE) as *mut c_void;
+                        let t = Instant::now();
+                        assert_eq!(XMemMapPhysicalPages(page_at, 1, &page), page_at);
+                        calls.push(t.elapsed().as_secs_f64() * 1e6);
+                        // SAFETY: mapped read-write just now.
+                        unsafe { page_at.cast::<u8>().write(2) };
+                    }
+                });
+                let slow: Vec<f64> = calls.iter().copied().filter(|&us| us >= 1000.0).collect();
+                let row = [
+                    calls.len() as f64 / seconds as f64,
+                    percentile(&mut calls, 50),
+                    percentile(&mut calls, 99),
+                    slow.len() as f64,
+                    slow.iter().sum::<f64>() / 1000.0,
+                ];
+                println!(
+                    "round {round}, sections {}: {:.0} remaps/s, median {:.1} us, p99 {:.1} us, {} of 1 ms or more ({:.0} ms)",
+                    name(*mb),
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4]
+                );
+                rows.push(row);
+                assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+                assert_eq!(XMemFreePhysicalPages(n, pages.as_ptr()), 1);
+            }
+        }
+        for (mb, rows) in &results {
+            let median = |i: usize| {
+                let mut v: Vec<f64> = rows.iter().map(|r| r[i]).collect();
+                percentile(&mut v, 50)
+            };
+            println!(
+                "median of {rounds} rounds, sections {}: {:.0} remaps/s, median {:.1} us, p99 {:.1} us, {} of 1 ms or more ({:.0} ms)",
+                name(*mb),
+                median(0),
+                median(1),
+                median(2),
+                median(3),
+                median(4)
+            );
+        }
     }
 }
