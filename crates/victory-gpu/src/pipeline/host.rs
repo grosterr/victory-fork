@@ -569,6 +569,7 @@ impl HostPipeline {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
+        let _dxil_pins: Vec<_> = shaders.iter().map(|s| s.pin_dxil()).collect();
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -736,12 +737,16 @@ impl HostPipeline {
                 return None;
             }
         };
+        let stage_dxils: Vec<std::sync::Arc<[u8]>> = stages
+            .iter()
+            .map(|(s, _)| s.dxil())
+            .collect::<Option<Vec<_>>>()?;
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            stage_dxils.get(i).map_or(
                 D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
+                |dxil| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: dxil.as_ptr().cast(),
+                    BytecodeLength: dxil.len(),
                 },
             )
         };
@@ -854,10 +859,11 @@ impl HostPipeline {
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
-        if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+        if g.topology.0 == RECTANGLES
+            && let Some(vs) = stage_dxils.first()
+        {
+            let ps = stage_dxils.get(1).map(|d| &**d);
+            match victory_shader::emit::rect_list_gs(vs, ps) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
@@ -1102,8 +1108,9 @@ fn linked(
         return None;
     }
     let (tm, tp) = (ms.translated()?, ps.translated()?);
+    let ms_dxil = ms.dxil()?;
     // (most mesh programs fit: nothing more to do for them)
-    if victory_shader::emit::mesh_fits(&tm.host.dxil).unwrap_or(true) {
+    if victory_shader::emit::mesh_fits(&ms_dxil).unwrap_or(true) {
         return None;
     }
     let key = (ms.hash.clone(), ps.hash.clone());
@@ -1111,7 +1118,12 @@ fn linked(
         return pair.clone();
     }
     // (translated outside the lock: two workers on one pair translate it twice at worst)
-    let pair = match victory_shader::emit::link_mesh(&ms.container, &tm.host, &ps.container, &tp.host) {
+    let ps_dxil = ps.dxil()?;
+    let ms_container = ms.container_bytes();
+    let ps_container = ps.container_bytes();
+    let ms_host = victory_shader::emit::HostShader { dxil: ms_dxil.to_vec(), ..tm.host.clone() };
+    let ps_host = victory_shader::emit::HostShader { dxil: ps_dxil.to_vec(), ..tp.host.clone() };
+    let pair = match victory_shader::emit::link_mesh(&ms_container, &ms_host, &ps_container, &ps_host) {
         Ok(Some(pair)) => {
             tracing::info!(shaders = ?[ms, ps], "mesh outputs over 32 KiB: the pair is linked for its pipeline");
             Some(Arc::new(pair))
