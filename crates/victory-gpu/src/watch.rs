@@ -32,6 +32,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
+use crate::cold_skip::Written;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -63,8 +65,9 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    /// Page number → the asking that last found it written, and with
+    /// `VICTORY_COLD_SKIP` the marks of its chunks (`crate::cold_skip`).
+    written: Written,
     /// With `VICTORY_DIRTY_4K` ([`dirty4k`]): page number → the asking of `written` for it, the asking before that
     /// which had found it written (0: never), and the 4 KiB kernel pages of it that asking found written (bit k: bytes
     /// `k * 4096..(k + 1) * 4096` of the page). Only where the kernel's write watch answered: a page noted written
@@ -85,7 +88,7 @@ struct Journal {
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
-    written: BTreeMap::new(),
+    written: Written::new(),
     sub: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
@@ -521,6 +524,26 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_lit(start, end, guarded, None)
+}
+
+/// [`writes`], with the marks of the range's chunks put into `marks`, read
+/// under the same lock as the pages (`VICTORY_COLD_SKIP`, `crate::cold_skip`).
+pub(crate) fn writes_marked(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: &mut Vec<(usize, u64)>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_lit(start, end, guarded, Some(marks))
+}
+
+fn writes_lit(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     // The light refresh: its bits kept, and asked or not, as the switch
     // says now.
     let light = if light_kept() { 1 + u8::from(light()) } else { 0 };
@@ -535,7 +558,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             );
         }
     }
-    writes_as(start, end, guarded, light)
+    writes_marking(start, end, guarded, light, marks)
+}
+
+/// [`writes_marking`] with no marks asked for.
+#[cfg(test)]
+fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_marking(start, end, guarded, light, None)
 }
 
 /// [`writes`] with the light refresh as `light` says ([`light`]): 0, as
@@ -543,7 +572,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// leaves clean get their bits and none is asked (the phase of `alt`
 /// without); 2, a range whose blocks all have their bit is answered from
 /// the journal.
-fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
+fn writes_marking(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    light: u8,
+    marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -551,13 +586,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     let j = &mut *held;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.ahead_asked, j.written.noted(first, last, marks)));
     }
     // The light refresh: every block of the range is read-only by our hand
     // and unwritten since an asking noted it, or a hole noted for good
@@ -567,13 +596,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     if guarded && light == 2 && published(j, first * PAGE, last * PAGE) {
         LIGHT_ASKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         j.asked += 1;
-        return Some((
-            j.asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.asked, j.written.noted(first, last, marks)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -663,13 +686,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
         LIGHT_ASKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         publish(j, &pages, first * PAGE, last * PAGE, told());
     }
-    let answer = (
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    );
+    let answer = (now, j.written.noted(first, last, marks));
     drop(held);
     // Read-only before the caller reads the blocks.
     arming.finish(failed && light != 0);
