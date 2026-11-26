@@ -13045,7 +13045,7 @@ mod cbv_snapshot_tests {
         }));
         assert_eq!(
             blocked_by(&[(address + 4, address + 8)], &[&list], false),
-            if fill_ahead::on() { None } else { Some(WHY_READ) }
+            if fill_ahead::on(address, 256) { None } else { Some(WHY_READ) }
         );
 
         list.defer_copy(ptr, source.as_ptr(), 128);
