@@ -2471,9 +2471,8 @@ mod tests {
 
     /// `PS_VoxelizeVisiblity`'s parking (0xa18-0xa38, 0xe44-0xe4c, 0x2df8, 0x3184): a lane
     /// mask parked in lanes 3 and 4 of v56 and taken back to make EXEC, later a single scalar
-    /// parked in lane 3. Built as it is, the mask comes back as two scalars (which the
-    /// structurisation follows back to the pair since fxceless#1112); with
-    /// [`with_shared_slots`] it comes back as the pair it is. Either way EXEC is the
+    /// parked in lane 3. With per-site webs ([`site_pairs`]), the clean save/restore web
+    /// comes back as `s_mov_b64` even without [`with_shared_slots`]; either way EXEC is the
     /// compare's lanes.
     #[test]
     fn a_mask_parked_in_lanes_another_scalar_shares_comes_back_whole_with_shared_slots() {
@@ -2504,7 +2503,7 @@ mod tests {
             i.name()
         };
         let alone = build(&code, true, 64).unwrap();
-        assert_eq!(at(&alone), "s_mov_b32");
+        assert_eq!(at(&alone), "s_mov_b64");
         let shared = with_shared_slots(|| build(&code, true, 64)).unwrap();
         assert_eq!(at(&shared), "s_mov_b64");
         let opaque = |p: &Program| {
