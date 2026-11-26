@@ -76,7 +76,7 @@ pub(crate) struct Staging {
 }
 
 /// A staging buffer nothing holds: the buffer and where it is mapped.
-struct Spare(ID3D12Resource, usize);
+struct Spare(ID3D12Resource, usize, u64);
 
 // SAFETY: a D3D12 buffer and its mapping, touched by nobody while it is
 // spare.
@@ -89,6 +89,57 @@ static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
 const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
 /// Staging buffers taken from the spare ones, and made, since the start.
 pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Releases spare D3D12 upload staging buffers from [`SPARE`] that have sat
+/// idle past the host's [`TrimPolicy::pool_idle_ms`] while keeping up to
+/// [`TrimPolicy::texture_spare_warm_bytes`] of hot staging buffers warm.
+fn trim_spare_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
+    let warm_limit = policy.texture_spare_warm_bytes.min(spare_most());
+    let mut freed: Vec<Spare> = Vec::new();
+    let mut freed_bytes = 0u64;
+    {
+        let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        let target = if policy.panic_memory { 0 } else { warm_limit };
+        if all.1 > target {
+            // Collect oldest-first candidates across size buckets (`returned_ms`).
+            let mut candidates: Vec<(u64, u64, usize)> = Vec::new();
+            for (&size, vec) in &all.0 {
+                for (idx, Spare(_, _, returned_ms)) in vec.iter().enumerate() {
+                    let age = now.saturating_sub(*returned_ms);
+                    if policy.panic_memory || age >= policy.pool_idle_ms {
+                        candidates.push((*returned_ms, size, idx));
+                    }
+                }
+            }
+            candidates.sort_by_key(|c| (c.0, c.1));
+            let mut to_remove: std::collections::BTreeMap<u64, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            let mut remaining = all.1;
+            for (_, size, idx) in candidates {
+                if remaining <= target {
+                    break;
+                }
+                remaining -= size;
+                freed_bytes += size;
+                to_remove.entry(size).or_default().push(idx);
+            }
+            for (size, mut indices) in to_remove {
+                indices.sort_unstable_by(|a, b| b.cmp(a));
+                if let Some(vec) = all.0.get_mut(&size) {
+                    for idx in indices {
+                        freed.push(vec.swap_remove(idx));
+                    }
+                    if vec.is_empty() {
+                        all.0.remove(&size);
+                    }
+                }
+            }
+            all.1 = remaining;
+        }
+    }
+    drop(freed);
+    crate::ram_trim::note_pool_trimmed(freed_bytes);
+}
 
 /// A mapped upload buffer of `total` bytes for a texture's staging, all
 /// zeros, and its pool size (0: not pooled).
@@ -122,7 +173,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         }
         taken
     };
-    if let Some(Spare(buffer, data)) = spare {
+    if let Some(Spare(buffer, data, _)) = spare {
         SPARE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the buffer's own mapping, `size` bytes, which nothing
         // else holds.
@@ -471,7 +522,9 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
         if read.len() < size {
             read.resize(size, 0);
         }
-        f(&mut read[..size])
+        let result = f(&mut read[..size]);
+        crate::ram_trim::maybe_shrink_scratch_vec(&mut read, size, 8 * crate::ram_trim::MIB);
+        result
     })
 }
 
@@ -511,10 +564,11 @@ impl Drop for Staging {
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
+            let now = crate::host::now_ms();
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
             if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
-                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+                all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize, now));
             }
         }
     }
@@ -550,35 +604,44 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
-pub(crate) fn let_go_idle() {
+pub(crate) fn let_go_idle_with(policy: &crate::ram_trim::TrimPolicy, now: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    // A list that recorded an upload or a check holds the staging until it
-    // is reset: one only the table holds is named by no list, recorded or
-    // running.
-    let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    let mut dropped_staging: Vec<Arc<Staging>> = Vec::new();
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut()
+            && !map.is_empty()
+        {
+            let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+            // A list that recorded an upload or a check holds the staging until it
+            // is reset: one only the table holds is named by no list, recorded or
+            // running.
+            let (mut went, mut bytes) = (0u64, 0u64);
+            let mut idle_keys = Vec::new();
+            for (&key, s) in map.iter() {
+                if Arc::strong_count(s) == 1
+                    && crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                {
+                    idle_keys.push(key);
+                }
+            }
+            for key in idle_keys {
+                if let Some(s) = map.remove(&key) {
+                    LET_GO[0].fetch_add(1, Relaxed);
+                    LET_GO[1].fetch_add(s.bytes, Relaxed);
+                    went += 1;
+                    bytes += s.bytes;
+                    dropped_staging.push(s);
+                }
+            }
+            if went > 0 {
+                crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
+            }
         }
-        keep
-    });
-    if went > 0 {
-        crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
+    drop(dropped_staging);
+    trim_spare_with(policy, now);
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -1689,5 +1752,83 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ram_trim_tests {
+    use super::*;
+    use crate::ram_trim::{HostTier, MIB, TrimPolicy};
+
+    #[test]
+    fn spare_trim_reclaims_only_cold_staging_buffers() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let mut buffers = Vec::new();
+        for _ in 0..3 {
+            let Some((buf, data)) = host.upload_buffer(MIB as u64) else {
+                return;
+            };
+            buffers.push((buf, data));
+        }
+
+        let turn = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        drop(turn);
+
+        let before_trimmed = crate::ram_trim::COUNTERS
+            .pool_trimmed_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let base_now = 1_000_000u64;
+        {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            all.0.clear();
+            all.1 = 0;
+            for (i, (buf, data)) in buffers.into_iter().enumerate() {
+                let ts = if i < 2 { base_now } else { base_now + 20_000 };
+                all.0
+                    .entry(MIB as u64)
+                    .or_default()
+                    .push(Spare(buf, data as usize, ts));
+                all.1 += MIB as u64;
+            }
+        }
+
+        let policy = TrimPolicy {
+            aggressive: false,
+            tier: HostTier::Standard32,
+            low_memory: false,
+            panic_memory: false,
+            pool_idle_ms: 10_000,
+            shadow_pool_warm_bytes: 0,
+            shadow_pool_reserve_slots: 0,
+            scratch_spare_warm_bytes: 0,
+            texture_spare_warm_bytes: MIB as u64,
+            list_idle_warm_count: 0,
+            list_idle_ms: 0,
+            shader_dxil_idle_ms: 0,
+            shader_container_idle_ms: 0,
+            decommit_cold_reference_ms: None,
+            fetched_warm_bytes: 0,
+        };
+        trim_spare_with(&policy, base_now + 21_000);
+
+        let remaining_bytes = {
+            let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            let rem = all.1;
+            // Verify only the fresh buffer (ts = base_now + 20_000) survived.
+            let entries = all.0.get(&(MIB as u64)).expect("one warm buffer stays");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].2, base_now + 20_000);
+            all.0.clear();
+            all.1 = 0;
+            rem
+        };
+        assert_eq!(remaining_bytes, MIB as u64);
+        let after_trimmed = crate::ram_trim::COUNTERS
+            .pool_trimmed_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after_trimmed >= before_trimmed + (2 * MIB as u64));
     }
 }

@@ -68,6 +68,7 @@ pub mod query;
 pub mod queue;
 #[cfg(windows)]
 mod queue2;
+mod ram_trim;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
