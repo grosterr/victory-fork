@@ -1387,6 +1387,341 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// The hash passes after ranges were sent up ([`super::rehash_runs`]): a
+/// pass a range, touching pieces joined, each piece once.
+#[cfg(test)]
+mod rehash_tests {
+    use super::REHASH_FOR_TEST;
+    use crate::shadow::Shadow;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
+    const LEN: usize = 1 << 20;
+    const PIECE: usize = 64 << 10;
+    const PIECES: usize = LEN / PIECE;
+
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        }
+    }
+
+    /// A title buffer of [`LEN`] bytes (on a piece's edge) with a copy in
+    /// the card's memory whose shader writes were declared once, so that
+    /// the card keeps a hash of each piece.
+    struct Copy {
+        base: usize,
+        copy: Arc<Shadow>,
+        readback: ID3D12Resource,
+    }
+
+    impl Copy {
+        fn new(seed: u64) -> Copy {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            let host = super::host().expect("a D3D12 device");
+            assert!(host.card_ready(), "the card's pipelines");
+            // SAFETY: a private allocation, kept until the process ends.
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    LEN,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(base, 0);
+            assert_eq!(base % PIECE, 0, "allocations start on 64 KiB");
+            let mut next = rng(seed);
+            // SAFETY: the allocation's bytes.
+            unsafe { std::slice::from_raw_parts_mut(base as *mut u8, LEN) }
+                .iter_mut()
+                .for_each(|b| *b = next() as u8);
+            crate::shadow::register(base, base as u64, LEN as u64);
+            let copy = crate::shadow::find(base as u64, LEN as u64).expect("the copy");
+            assert!(copy.carded(), "the copy must be in the card's memory");
+            let list = host.new_list().unwrap();
+            copy.refresh(&list, base as u64, LEN as u64);
+            copy.gpu_writes(&list, base as u64, LEN as u64);
+            list.close();
+            host.execute(&[&list]);
+            let readback = host
+                .read_back_buffer(LEN as u64)
+                .expect("a read-back buffer");
+            Copy {
+                base,
+                copy,
+                readback,
+            }
+        }
+
+        #[allow(clippy::mut_from_ref)]
+        fn title(&self) -> &mut [u8] {
+            // SAFETY: the allocation, which lives on; the test's thread only.
+            unsafe { std::slice::from_raw_parts_mut(self.base as *mut u8, LEN) }
+        }
+
+        /// `len` bytes of `from` (the card side or its hashes), read back.
+        fn read(&self, from: &ID3D12Resource, len: usize) -> Vec<u8> {
+            let host = super::host().unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: live buffers of `len` bytes or more.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&self.readback, 0, from, 0, len as u64)
+            };
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the card wrote them, and was waited for.
+            unsafe {
+                self.readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let out = std::slice::from_raw_parts(mapped.cast::<u8>(), len).to_vec();
+                self.readback.Unmap(0, None);
+                out
+            }
+        }
+
+        fn card(&self) -> Vec<u8> {
+            self.read(&self.copy.buffer, LEN)
+        }
+
+        /// The card's hash of each piece, 16 bytes a piece.
+        fn hashes(&self) -> Vec<u8> {
+            let hashes = self
+                .copy
+                .card_sides()
+                .and_then(|s| s.1)
+                .expect("the card's hashes of the copy");
+            self.read(&hashes, PIECES * 16)
+        }
+
+        /// The title changes `runs` (each byte of them), and the runs go
+        /// into the CPU side and are noted for the card.
+        fn change(&self, runs: &[(usize, usize)], flip: u8) {
+            let title = self.title();
+            for &(a, b) in runs {
+                title[a..b].iter_mut().for_each(|t| *t ^= flip);
+            }
+            self.copy.card_put_runs(title, runs);
+        }
+    }
+
+    /// [`super::CARD_COMPARE`]'s hash of a 64 KiB piece of a copy that
+    /// starts on a piece's edge.
+    fn piece_hash(bytes: &[u8]) -> [u8; 16] {
+        const MUL: [u32; 4] = [0x0100_0193, 0x9E37_79B1, 0x85EB_CA77, 0xC2B2_AE3D];
+        let mut h = [0x9E37_79B9u32, 0x85EB_CA6B, 0xC2B2_AE35, 0x27D4_EB2F];
+        for chunk in bytes.chunks_exact(16) {
+            for k in 0..4 {
+                let w = u32::from_le_bytes(chunk[4 * k..4 * k + 4].try_into().unwrap());
+                h[k] = (h[k] ^ w).wrapping_mul(MUL[k]);
+            }
+            h = [
+                h[1] ^ (h[0] >> 15),
+                h[2] ^ (h[1] >> 15),
+                h[3] ^ (h[2] >> 15),
+                h[0] ^ (h[3] >> 15),
+            ];
+        }
+        let mut out = [0; 16];
+        for k in 0..4 {
+            out[4 * k..4 * k + 4].copy_from_slice(&h[k].to_le_bytes());
+        }
+        out
+    }
+
+    /// Random runs: in one piece, across piece edges, several in a piece,
+    /// in pieces that touch and in pieces apart, overlapping each other.
+    fn random_runs(next: &mut impl FnMut() -> u64, case: usize) -> Vec<(usize, usize)> {
+        let count = [1usize, 2, 3, 16, 100, 1000, 5000][case % 7];
+        let longest = [1usize, 16, 300, PIECE + 77][(case / 7) % 4];
+        let mut runs: Vec<(usize, usize)> = (0..count)
+            .map(|_| {
+                let a = next() as usize % (LEN - 1);
+                (a, (a + 1 + next() as usize % longest).min(LEN))
+            })
+            .collect();
+        // Half the cases in address order, as the merge notes them.
+        if case.is_multiple_of(2) {
+            runs.sort_unstable();
+        }
+        runs
+    }
+
+    /// Every way, the pieces the ranges sent up touch are hashed again from
+    /// the bytes the card now holds, and no other piece's hash changes;
+    /// three copies given the same changes end with the same hashes byte
+    /// for byte. Random runs, 56 cases.
+    #[test]
+    #[ignore = "needs a D3D12 adapter; run alone"]
+    fn joined_rehash_leaves_the_hashes_a_pass_a_range_does() {
+        let narrow = !super::card_hash_wide();
+        // A pass a range, touching pieces joined, each piece once.
+        let ways = [
+            (2u8, Copy::new(0x5EED)),
+            (1, Copy::new(0x5EED)),
+            (3, Copy::new(0x5EED)),
+        ];
+        let apart = &ways[0].1;
+        let host = super::host().unwrap();
+        let mut next = rng(0xA11CE);
+        let mut passes = [0u64; 3];
+        for case in 0..56usize {
+            let runs = random_runs(&mut next, case);
+            let flip = 1 | next() as u8;
+            let old = apart.hashes();
+            for (k, (mode, copy)) in ways.iter().enumerate() {
+                assert_eq!(copy.hashes(), old, "case {case}: the same hashes before");
+                REHASH_FOR_TEST.store(*mode, Ordering::Relaxed);
+                copy.change(&runs, flip);
+                let counted = super::CARD_PASSES[0].load(Ordering::Relaxed);
+                host.card_sync_timed();
+                passes[k] += super::CARD_PASSES[0].load(Ordering::Relaxed) - counted;
+            }
+            REHASH_FOR_TEST.store(0, Ordering::Relaxed);
+            let card = apart.card();
+            assert!(
+                card == apart.title(),
+                "case {case}: the card side took the title's bytes"
+            );
+            let got = apart.hashes();
+            for (mode, copy) in &ways[1..] {
+                assert!(
+                    copy.card() == card,
+                    "case {case}: every copy holds the same bytes"
+                );
+                assert_eq!(
+                    copy.hashes(),
+                    got,
+                    "case {case}: way {mode} leaves the hashes a pass a range does"
+                );
+            }
+            for p in 0..PIECES {
+                let touched = runs
+                    .iter()
+                    .any(|&(a, b)| a < (p + 1) * PIECE && b > p * PIECE);
+                let (hash, was) = (&got[16 * p..16 * p + 16], &old[16 * p..16 * p + 16]);
+                if !touched {
+                    assert_eq!(hash, was, "case {case}: piece {p} was not sent up");
+                } else if narrow {
+                    assert_eq!(
+                        hash,
+                        piece_hash(&card[p * PIECE..(p + 1) * PIECE]),
+                        "case {case}: piece {p} hashed again"
+                    );
+                }
+            }
+        }
+        assert!(
+            passes[1] <= passes[2] && passes[2] < passes[0],
+            "joined took fewer passes: {passes:?}"
+        );
+        eprintln!(
+            "joined_rehash_leaves_the_hashes_a_pass_a_range_does: 56 cases, the same hashes; hash passes a range each {}, touching joined {}, each piece once {}",
+            passes[0], passes[1], passes[2]
+        );
+    }
+
+    fn median(v: &mut [f64]) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// The submitting thread's time in `card_before` and the card's for
+    /// ranges sent up, the three ways of [`super::rehash_runs`]. Cases:
+    /// `pages` x `runs` changed runs of two bytes, evenly apart in each of
+    /// the first `pages` 64 KiB pieces. `REHASH_BENCH_ROUNDS` (15) rounds
+    /// measured after two, the three ways in turn inside a round. Prints a
+    /// table; asserts nothing.
+    #[test]
+    #[ignore = "a benchmark: needs a D3D12 adapter and a quiet machine"]
+    fn rehash_bench() {
+        let rounds: usize = std::env::var("REHASH_BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15);
+        let host = super::host().unwrap();
+        let copy = Copy::new(0xBE7C);
+        println!(
+            "rehash_bench: median of {rounds} rounds; VICTORY_CARD_HASH_WIDE={}",
+            std::env::var("VICTORY_CARD_HASH_WIDE").unwrap_or_else(|_| "unset".into())
+        );
+        println!(
+            "| pages x runs | way | ranges sent | hash passes | submitting thread (us) | card (us) |"
+        );
+        println!("|---|---|---:|---:|---:|---:|");
+        let cases: &[(usize, usize)] = &[
+            (1, 1),
+            (1, 16),
+            (1, 256),
+            (1, 4096),
+            (1, 16384),
+            (4, 16384),
+            (2, 1),
+            (4, 1),
+            (16, 1),
+            (16, 16),
+            (16, 256),
+        ];
+        let mut flip = 0u8;
+        for &(pages, runs) in cases {
+            let stride = PIECE / runs;
+            let ranges: Vec<(usize, usize)> = (0..pages)
+                .flat_map(|p| {
+                    (0..runs).map(move |r| (p * PIECE + r * stride, p * PIECE + r * stride + 2))
+                })
+                .collect();
+            // Per way: the submitting thread's times, the card's, ranges, passes.
+            let mut out: [(Vec<f64>, Vec<f64>, u64, u64); 3] = Default::default();
+            for round in 0..rounds + 2 {
+                for k in [round % 3, (round + 1) % 3, (round + 2) % 3] {
+                    REHASH_FOR_TEST.store([2, 1, 3][k], Ordering::Relaxed);
+                    flip = flip.wrapping_add(2) | 1;
+                    copy.change(&ranges, flip);
+                    let counted = (
+                        crate::shadow::CARD_STATS[1].load(Ordering::Relaxed),
+                        super::CARD_PASSES[0].load(Ordering::Relaxed),
+                    );
+                    let (spent, card) = host.card_sync_timed();
+                    let o = &mut out[k];
+                    o.2 = crate::shadow::CARD_STATS[1].load(Ordering::Relaxed) - counted.0;
+                    o.3 = super::CARD_PASSES[0].load(Ordering::Relaxed) - counted.1;
+                    if round >= 2 {
+                        o.0.push(spent.as_secs_f64() * 1e6);
+                        o.1.push(card * 1e6);
+                    }
+                }
+            }
+            for (k, way) in [
+                "a pass a range (=0)",
+                "touching joined (=1)",
+                "each piece once (default)",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let o = &mut out[k];
+                println!(
+                    "| {pages} x {runs} | {way} | {} | {} | {:.1} | {:.1} |",
+                    o.2,
+                    o.3,
+                    median(&mut o.0),
+                    median(&mut o.1)
+                );
+            }
+        }
+        REHASH_FOR_TEST.store(0, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Run once with VICTORY_CARD_SYNC_BATCH=0 and once with it set to 1.
@@ -2816,47 +3151,107 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 }
 "#;
 
-/// Whether the pieces hashed again after ranges were sent up to a copy in
-/// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// How the pieces hashed again after ranges were sent up to a copy in the
+/// card's memory are cut into passes (`VICTORY_CARD_REHASH_RUNS`):
+///
+/// - unset (the default): runs of pieces that share a piece are one pass,
+///   so each piece is hashed once ([`Rehash::Sharing`]);
+/// - `1`: runs of pieces that share or touch a piece are one pass
+///   ([`Rehash::Touching`]);
+/// - `0`: a pass per range sent up ([`Rehash::Apart`]; the default before).
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
 /// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
 /// the time of one piece however few its pieces are. Run 102 sent up 514
-/// ranges a frame: 514 such passes. The same pieces are hashed either way;
+/// ranges a frame: 514 such passes. The same pieces are hashed every way;
 /// a piece hashed when it need not be, or not hashed when it should, costs
 /// a fetch that finds nothing and loses no shader write.
 ///
-/// `VICTORY_CARD_REHASH_RUNS=alt`: twenty seconds with, twenty without, in
-/// turn, each change said in the log: one run then measures both on the
+/// Measured on the card alone (`rehash_tests::rehash_bench`, median of 15
+/// rounds): a 64 KiB piece with 16,384 changed runs sent up took 16,384
+/// passes, 14 to 15 ms of an RTX 4060 Laptop's time and 362 ms of an Intel
+/// UHD's; joined, one pass: 0.43 and 36.5 ms. But [`CARD_COMPARE`] gives a
+/// pass's pieces a thread each in one group, and 16 touching pieces with
+/// one range each took 179 us of the RTX's time as 16 passes and 266 us as
+/// one (Intel: 1.15 and 1.23 ms): pieces that only touch are joined only
+/// when `1` asks. The hashes are the same every way
+/// (`rehash_tests::joined_rehash_leaves_the_hashes_a_pass_a_range_does`).
+///
+/// `VICTORY_CARD_REHASH_RUNS=alt`: twenty seconds as `1`, twenty as `0`,
+/// in turn, each change said in the log: one run then measures both on the
 /// same scene (the card meter's "send-and-hash lists" in the frame log).
 /// Runs 105-110 found no change in the frame, but the card was not the
 /// frame's limit then.
-fn rehash_runs() -> bool {
-    /// 0 off, 1 on, 2 in turn.
+fn rehash_runs() -> Rehash {
+    /// 0 apart, 1 touching, 2 in turn, 3 sharing.
     static MODE: OnceLock<u8> = OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
-        Ok("1") => 1,
-        Ok("alt") => 2,
-        _ => 0,
-    }) {
-        0 => false,
-        1 => true,
+    #[cfg(test)]
+    match REHASH_FOR_TEST.load(Ordering::Relaxed) {
+        1 => return Rehash::Touching,
+        2 => return Rehash::Apart,
+        3 => return Rehash::Sharing,
+        _ => {}
+    }
+    match *MODE.get_or_init(
+        || match std::env::var("VICTORY_CARD_REHASH_RUNS").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            Ok("alt") => 2,
+            _ => 3,
+        },
+    ) {
+        0 => Rehash::Apart,
+        1 => Rehash::Touching,
+        3 => Rehash::Sharing,
         _ => {
             let joined = (now_us() / 20_000_000) % 2 == 1;
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(joined), Ordering::Relaxed) != u8::from(joined) {
                 tracing::info!(
                     "card rehash passes from now (VICTORY_CARD_REHASH_RUNS=alt): {}",
-                    if joined { "JOINED, one pass a run of touching pieces" } else { "one pass a range sent up, as usual" }
+                    if joined {
+                        "JOINED, one pass a run of touching pieces"
+                    } else {
+                        "one pass a range sent up"
+                    }
                 );
             }
-            joined
+            if joined {
+                Rehash::Touching
+            } else {
+                Rehash::Apart
+            }
         }
     }
 }
+
+/// See [`rehash_runs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rehash {
+    /// A pass per range sent up.
+    Apart,
+    /// Runs of pieces that share or touch a piece are one pass.
+    Touching,
+    /// Runs of pieces that share a piece are one pass.
+    Sharing,
+}
+
+impl Rehash {
+    fn text(self) -> &'static str {
+        match self {
+            Rehash::Apart => "a pass a range, VICTORY_CARD_REHASH_RUNS=0",
+            Rehash::Touching => "touching pieces joined, VICTORY_CARD_REHASH_RUNS=1",
+            Rehash::Sharing => "each piece once, the default",
+        }
+    }
+}
+
+/// For tests: 0 as the environment says, 1 [`Rehash::Touching`], 2
+/// [`Rehash::Apart`], 3 [`Rehash::Sharing`].
+#[cfg(test)]
+pub(crate) static REHASH_FOR_TEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
 
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
@@ -5671,7 +6066,11 @@ impl Host {
                                 w.ranges.iter().map(|&(a, b)| w.shadow.card_run(a, b)).collect()
                             };
                             // The same pieces in fewer passes (`rehash_runs`).
-                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            let runs = match rehash_runs() {
+                                Rehash::Apart => runs,
+                                Rehash::Touching => crate::shadow::joined_piece_runs(runs, true),
+                                Rehash::Sharing => crate::shadow::joined_piece_runs(runs, false),
+                            };
                             CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                             CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                             for run in runs {
@@ -5879,6 +6278,89 @@ impl Host {
         if !relay() || work.out == 0 {
             work.taken = 0;
         }
+    }
+
+    /// For tests and benchmarks: brings the copies in the card's memory
+    /// up to date as a submission does before its lists
+    /// ([`Host::card_before`], with no lists), and waits for the card.
+    /// Returns the time `card_before` took on this thread, and the card's
+    /// time from a timestamp before its list to one after it, in seconds.
+    #[cfg(test)]
+    pub(crate) fn card_sync_timed(&self) -> (std::time::Duration, f64) {
+        let heap = {
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                self.device
+                    .CreateQueryHeap(
+                        &D3D12_QUERY_HEAP_DESC {
+                            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                            Count: 2,
+                            NodeMask: 0,
+                        },
+                        &mut heap,
+                    )
+                    .expect("a timestamp heap");
+            }
+            heap.expect("a timestamp heap")
+        };
+        let back = self.read_back_buffer(16).expect("a read-back buffer");
+        let (first, last) = (
+            self.make_prelude().expect("a list"),
+            self.make_prelude().expect("a list"),
+        );
+        // The queue waits for this gate until all three lists are on it, so
+        // that the stamps time the card's work and not this thread's.
+        // SAFETY: plain creation.
+        let gate: ID3D12Fence =
+            unsafe { self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("a fence");
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: lists of ours, closed after recording; live objects held
+        // until the fence below has passed them.
+        let (spent, plan) = unsafe {
+            self.queue.Wait(&gate, 1).unwrap();
+            first.0.Reset().unwrap();
+            first.1.Reset(&first.0, None).unwrap();
+            first.1.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            first.1.Close().unwrap();
+            self.queue
+                .ExecuteCommandLists(&[Some(first.1.cast().unwrap())]);
+            let started = std::time::Instant::now();
+            let plan = self.card_before(&[], false, *submitted);
+            let spent = started.elapsed();
+            last.0.Reset().unwrap();
+            last.1.Reset(&last.0, None).unwrap();
+            last.1.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            last.1
+                .ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+            last.1.Close().unwrap();
+            self.queue
+                .ExecuteCommandLists(&[Some(last.1.cast().unwrap())]);
+            gate.Signal(1).unwrap();
+            *submitted += 1;
+            self.queue.Signal(&self.fence, *submitted).unwrap();
+            self.fence
+                .SetEventOnCompletion(*submitted, HANDLE::default())
+                .unwrap();
+            (spent, plan)
+        };
+        drop(submitted);
+        if let Some(plan) = plan {
+            self.card_done(plan);
+        }
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the card wrote both stamps (the fence passed them).
+        let stamps = unsafe {
+            back.Map(0, None, Some(&mut mapped)).unwrap();
+            let stamps = mapped.cast::<[u64; 2]>().read_unaligned();
+            back.Unmap(0, None);
+            stamps
+        };
+        let frequency = self.timestamp_frequency().max(1);
+        (
+            spent,
+            stamps[1].saturating_sub(stamps[0]) as f64 / frequency as f64,
+        )
     }
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
@@ -10071,8 +10553,8 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (passes: {}), {compares:.0} compare passes",
+                    rehash_runs().text()
                 );
             }
         }
