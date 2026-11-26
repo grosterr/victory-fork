@@ -55,7 +55,12 @@ impl Lower<'_> {
         }
         let c = self.cur;
         let &m = self.x.st.masks.get(&mask).ok_or("a wave reduction's untracked mask")?;
-        let on = self.boolean(m, c)?;
+        let mut on = self.boolean(m, c)?;
+        if let Some(active) = self.partial_active
+            && self.x.st.active.contains(&mask)
+        {
+            on = self.s.m.bin(c, Bin::And, on, active);
+        }
         let (l, h) = (self.i32_of(lo)?, self.i32_of(hi)?);
         let x = self.masked_double(on, l, h);
         let r = self.wave_sum_f64(x);

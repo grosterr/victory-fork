@@ -234,6 +234,9 @@ pub(crate) struct Translated {
     /// cold shaders can drop DXIL RAM and reload on demand).
     #[cfg(windows)]
     dxil: std::sync::Mutex<Option<std::sync::Arc<[u8]>>>,
+    /// A compute shader's group size (`numthreads`); `[0; 3]` for other
+    /// stages. A `DispatchX` that counts threads is made groups with it.
+    pub(crate) threads: [u32; 3],
 }
 
 #[cfg(windows)]
@@ -410,19 +413,20 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
+    let main = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let threads = match main.as_ref().map(|p| &p.io) {
+        Some(victory_shader::native::StageIo::Cs(cs)) => cs.threads,
+        _ => [0; 3],
+    };
+    let used = main.map(|p| p.used).unwrap_or_default();
     let mut host = host;
     let dxil = std::sync::Mutex::new(Some(std::sync::Arc::from(std::mem::take(&mut host.dxil))));
-    Ok(Translated { host, used, stores, dxil })
+    Ok(Translated { host, used, stores, dxil, threads })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

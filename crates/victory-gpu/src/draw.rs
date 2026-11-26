@@ -545,6 +545,10 @@ pub(crate) struct State {
     /// bind: `[row, asked x]` (`[0, 0]`: not spread; an indirect one gets
     /// its words from the clamp through its command signature).
     dispatch_spread: [u32; 2],
+    /// A `DispatchX` that counts threads, for [`State::host_word`] at its
+    /// bind: the count per axis where it is not a whole number of groups,
+    /// else 0 (`USER_DISPATCH_THREADS`; fork pull request #646).
+    dispatch_threads: [u32; 3],
     /// Diagnostics: the argument buffer and the offset of the indirect
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
@@ -980,6 +984,24 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Frames between looks at an uploaded texture picked by index once
+/// [`RECHECK_FRAMES`] is through (`VICTORY_HEAP_RECHECK_EVERY=<frames>`; unset
+/// or 0: it is not looked at again, as before). The title streams a
+/// texture's memory in and rewrites it long after its view was written:
+/// runs 338-339 logged changes found at the schedule's last look, and what
+/// changes later stays as it was on the card for the rest of the run (skin
+/// that turns black or red). After RyanCase94's 920423a9.
+fn recheck_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if every > 0 {
+            tracing::info!("uploaded textures picked by index are looked at again every {every} frames (VICTORY_HEAP_RECHECK_EVERY)");
+        }
+        every
+    })
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1470,9 +1492,14 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         if kind == USER_DISPATCH_SPREAD {
             return self.dispatch_spread[usize::from(dword != 0)];
+        }
+        if kind == USER_DISPATCH_THREADS {
+            return self.dispatch_threads.get(dword as usize).copied().unwrap_or(0);
         }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
@@ -1706,7 +1733,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, &spans, &mut staged);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2984,7 +3011,13 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // The schedule is over: looked at again every so many
+                        // frames for as long as the slot shows it
+                        // (`recheck_every`), or never again.
+                        None => match recheck_every() {
+                            0 => host.texture_slot_done(index, write, None),
+                            every => host.texture_slot_recheck(index, write, frame + every, (at, len), print, looks, uploaded),
+                        },
                     }
                     continue;
                 }
@@ -3260,6 +3293,9 @@ impl State {
         if !stores {
             return;
         }
+        // The open segment of gathered records ends whatever the prelude's gathering does
+        // (`crate::indirect::gather_segments`).
+        list.segments_end();
         // Whole, as before: without the switch, for a pipeline the layer
         // does not know, and for shaders that can store through a view
         // that is NOT declared where they are prepared: a buffer picked
@@ -3285,8 +3321,17 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_x(list, x, y, z, 0);
+    }
+
+    /// Runs a console `DispatchX(x, y, z, flags)` on the host: with
+    /// `USE_THREAD_DIMENSIONS` (flags bit 5) the counts are threads, made
+    /// groups here, and the program leaves out the threads past them
+    /// ([`dispatch_dimensions`]; fork pull request #646).
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        crate::indirect::end_window(list);
         self.gather_ends(list, true);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -3323,6 +3368,29 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // Counts of threads: the groups that hold them, and the counts the
+        // program needs where the last group is cut (fork pull request #646:
+        // taken as groups, the structure builder's box stages ran up to 64
+        // times the threads asked and wrote past their structures).
+        let translated = p.stages[0].translated();
+        let Some(([x, y, z], partial)) = dispatch_dimensions([x, y, z], translated.threads, flags) else {
+            return;
+        };
+        if partial != [0; 3]
+            && !translated
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS))
+        {
+            once!(
+                pipeline = %p.name,
+                threads = ?partial,
+                group = ?translated.threads,
+                "a DispatchX counting threads cuts its last group, and its program does not take the count: \
+                 the threads past it run"
+            );
+        }
         // More than 65,535 groups in x: spread across z for a program that
         // takes the spread words (`USER_DISPATCH_SPREAD`).
         let (row, asked, gx, gy, gz) = victory_shader::emit::spread_groups(x, y, z, spreads(p).is_some());
@@ -3332,8 +3400,10 @@ impl State {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
         }
         self.dispatch_spread = [row, asked];
+        self.dispatch_threads = partial;
         let bound = self.bind(list, p, true);
         self.dispatch_spread = [0, 0];
+        self.dispatch_threads = [0; 3];
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3605,6 +3675,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        crate::indirect::end_window(list);
         self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -3739,11 +3810,20 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
         compute: bool,
         spans: &[(u8, u32, u32)],
         staged: &mut Vec<(u64, u32)>,
@@ -3755,6 +3835,36 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -3816,6 +3926,15 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            selected.extend(
+                half.iter()
+                    .filter(|&&(s, _)| s == slot)
+                    .map(|&(_, at)| at / 8),
+            );
             selected.sort_unstable();
             selected.dedup();
             let n = entries
@@ -3854,6 +3973,9 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    half.contains(&(slot, k * 8)).hash(&mut h);
                 }
                 (table, n, h.finish())
             };
@@ -3942,7 +4064,10 @@ impl State {
                         }
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         #[cfg(feature = "diagnostics")]
                         {
                             tally(if crate::descriptor::host::is_texture_view(&view) { 14 } else { 15 }, 1);
@@ -4070,6 +4195,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        crate::indirect::end_window(list);
         self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -4175,6 +4301,7 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        crate::indirect::end_window(list);
         self.gather_ends(list, self.may_store());
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -4294,7 +4421,13 @@ impl State {
             .flatten()
             .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
         let is_spread = spread.is_some();
-        let Some(signature) = spread.or_else(|| {
+        // Lean (`VICTORY_SPREAD_LEAN`): the records within 65,535 groups go
+        // through the plain dispatch signature, and the spread signature
+        // runs only under a predicate the clamp sets when a record passes it.
+        let plain = (is_spread && max > 0 && max <= crate::indirect::LEAN_RECORDS && spread_lean_on())
+            .then(|| host_signature(DISPATCH, 12))
+            .flatten();
+        let Some(signature) = spread.clone().or_else(|| {
             matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
                 .then(|| host_signature(kind, stride))
                 .flatten()
@@ -4323,7 +4456,15 @@ impl State {
         if !windowed || first_on_list {
             self.window = None;
         }
-        if !windowed {
+        // An indirect dispatch's own record may take a gathered slot as a draw's does
+        // (`crate::indirect::gather_dispatches`); the dispatch ends the gathering right after that, below.
+        let joins = kind == DISPATCH
+            && max == 1
+            && count.is_none()
+            && !is_spread
+            && gathers()
+            && crate::indirect::gather_dispatches();
+        if !windowed && !joins {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
             self.gather_ends(list, true);
@@ -4359,7 +4500,7 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
-        let gathered = if hit.is_none() && windowed && gathers() {
+        let gathered = if hit.is_none() && (windowed || joins) && gathers() {
             let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4367,6 +4508,13 @@ impl State {
         } else {
             None
         };
+        if joins {
+            // The dispatch's record is taken (or clamped alone below): what the dispatch writes, from here on.
+            self.gather_ends(list, true);
+        }
+        // With a lean clamp: the predicate word's and the spread records'
+        // offsets in `bounded` (the plain records are at 0).
+        let mut lean = None;
         let (bounded, at) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
@@ -4393,7 +4541,12 @@ impl State {
                 }
                 (scratch, at)
             }
-            (None, Some((scratch, at))) => {
+            (None, Some((scratch, at, recorded))) => {
+                // A segment's pass recorded here bound our pipeline (`crate::indirect::gather_segments`).
+                if recorded {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
                 // The record's bytes are up to date when the list is
                 // submitted, as for a record clamped in the list.
                 args.refresh(list, arguments, len);
@@ -4461,8 +4614,27 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                // With `VICTORY_CLAMP_WINDOW`: the record clamped in the list's window of indirect draws (a draw with no
+                // count buffer whose shaders cannot store), at `window_at` in the window's buffer.
+                let mut window_at = None;
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                } else if let Some((dst, at, opened)) = (crate::indirect::clamp_window()
+                    && count_arg.is_none()
+                    && !is_spread
+                    && kind != DISPATCH
+                    && !self.may_store())
+                .then(|| crate::indirect::windowed(list, (&args.buffer, offset), (kind, step, records)))
+                .flatten()
+                {
+                    window_at = Some((at, opened));
+                    Some(dst)
+                } else if let Some((dst, pred, spread_at)) = plain
+                    .as_ref()
+                    .and_then(|_| crate::indirect::bound_lean(list, (&args.buffer, offset), count_arg, (kind, step, records)))
+                {
+                    lean = Some((pred, spread_at));
+                    Some(dst)
                 } else {
                     // (A spread dispatch is never windowed: `windowed` is
                     // false for dispatches.)
@@ -4498,18 +4670,29 @@ impl State {
                         }
                     }
                 }
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
-                (bounded, 0)
+                if let Some((at, opened)) = window_at {
+                    // A draw that joined a window recorded no pass: the graphics state stands.
+                    if opened {
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                    }
+                    // The records sit at `at` of the window's buffer: no ahead-window state is kept over them.
+                    self.window = None;
+                    (bounded, at)
+                } else {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                    self.window = windowed.then(|| Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                    });
+                    (bounded, 0)
+                }
             }
         };
         #[cfg(feature = "diagnostics")]
@@ -4533,18 +4716,26 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
+        let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
+        let count_offset = counter.as_ref().map_or(0, |(s, at)| s.offset(*at));
+        if let (Some(plain), Some((pred, spread_at))) = (plain.as_ref().filter(|_| lean.is_some()), lean) {
+            // SAFETY: as below. `bound_lean` left `bounded` in
+            // `INDIRECT_ARGUMENT`, which is also the predication state; the
+            // bound program's spread words are 0 for the plain records (its
+            // bind sets them so for an indirect dispatch), and the spread
+            // signature sets them for the spread ones. Predication is off
+            // again before anything else is recorded.
+            unsafe {
+                list.list.ExecuteIndirect(plain, max, &bounded, 0, count_buffer, count_offset);
+                list.list.SetPredication(&bounded, pred, D3D12_PREDICATION_OP_EQUAL_ZERO);
+                list.list.ExecuteIndirect(&signature, max, &bounded, spread_at, count_buffer, count_offset);
+                list.list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
+        } else {
+            // SAFETY: an open list with everything set; the scratch buffer and
+            // host copies are kept alive by the list, and the signature is cached.
+            unsafe { list.list.ExecuteIndirect(&signature, max, &bounded, at, count_buffer, count_offset) };
+        }
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
@@ -4555,6 +4746,9 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if is_spread {
                 SPREAD[1].fetch_add(1, Ordering::Relaxed);
+                if lean.is_some() {
+                    SPREAD[2].fetch_add(1, Ordering::Relaxed);
+                }
             }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4567,8 +4761,35 @@ impl State {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 /// Dispatches spread across z since the frame line last took them: direct,
-/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
-pub(crate) static SPREAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]), and of the
+/// indirect ones those run lean ([`spread_lean_on`]).
+pub(crate) static SPREAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `COMPUTE_DISPATCH_INITIATOR` bit 5, `USE_THREAD_DIMENSIONS`: a
+/// `DispatchX` whose `x`, `y`, `z` count threads, not groups; in the last
+/// group of an axis the threads at or past the count are not in EXEC.
+const DISPATCH_THREAD_COUNTS: u32 = 0x20;
+
+/// A console dispatch `(x, y, z)` with `DispatchX` flags `flags`, as host
+/// groups and the thread counts the program is to keep to: per axis the
+/// count where it is not a whole number of `group`-thread groups, else 0
+/// (`USER_DISPATCH_THREADS`). Without [`DISPATCH_THREAD_COUNTS`] the counts
+/// are groups and go as they are. `None`: no thread along some axis, so
+/// nothing to run. (Fork pull request #646, mynzjerko.)
+fn dispatch_dimensions(dims: [u32; 3], group: [u32; 3], flags: u32) -> Option<([u32; 3], [u32; 3])> {
+    if flags & DISPATCH_THREAD_COUNTS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    if dims.contains(&0) {
+        return None;
+    }
+    let groups = std::array::from_fn(|c| dims[c].div_ceil(group[c].max(1)));
+    let partial = std::array::from_fn(|c| {
+        let g = group[c].max(1);
+        if g > 1 && !dims[c].is_multiple_of(g) { dims[c] } else { 0 }
+    });
+    Some((groups, partial))
+}
 
 /// The user-data root parameter of compute pipeline `p` whose program takes
 /// the spread words, and the index of the first in it (the second follows:
@@ -4613,6 +4834,42 @@ fn spread_on() -> bool {
                 tracing::info!(
                     "dispatches past 65,535 groups are spread across z from now (VICTORY_DISPATCH_SPREAD=alt): {}",
                     if on { "ON" } else { "off, clamped to 65,535 as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Whether a spread indirect dispatch of at most
+/// [`crate::indirect::LEAN_RECORDS`] records runs lean
+/// (`VICTORY_SPREAD_LEAN`: off by default; `1` on; `alt` twenty seconds
+/// with, twenty without, in turn, each change said in the log): the clamp
+/// writes its records within 65,535 groups in x for the plain dispatch
+/// signature and the others for the spread signature, which runs under a
+/// predicate the clamp sets only when a record passes 65,535. An
+/// `ExecuteIndirect` whose signature sets root constants costs far more on
+/// some cards than a plain one (an RTX 3060: about 13 ms of the card's time
+/// a frame for ~1,000 of them, of which ~1 a frame passes 65,535), and
+/// nothing is clamped to 65,535 either way.
+fn spread_lean_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD_LEAN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "indirect dispatches spread across z run lean from now (VICTORY_SPREAD_LEAN=alt): {}",
+                    if on { "ON" } else { "off, every record through the spread signature" }
                 );
             }
             on
@@ -5077,5 +5334,24 @@ mod tests {
         // No records at all: the constants' own.
         put(&mut constants, 0x7c, 2);
         assert_eq!(bake_named(&constants, 0, record), ((100..105).collect(), (0, 0)));
+    }
+
+    /// Fork pull request #646: a `DispatchX` with bit 5 counts threads.
+    #[test]
+    fn a_dispatch_counting_threads_runs_the_groups_that_hold_them() {
+        // Without bit 5 (plain Dispatch, or only the 32-lane bit 0x8000): groups.
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0), Some(([48, 1, 1], [0; 3])));
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x8000), Some(([48, 1, 1], [0; 3])));
+        // Threads: the groups that hold them, and the count where the last is cut.
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x20), Some(([1, 1, 1], [48, 0, 0])));
+        assert_eq!(dispatch_dimensions([1, 1, 1], [64, 1, 1], 0x8020), Some(([1, 1, 1], [1, 0, 0])));
+        assert_eq!(dispatch_dimensions([65, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], [65, 0, 0])));
+        // The builder's box stage: 5,348 nodes of one thread each in groups of 64.
+        assert_eq!(dispatch_dimensions([5348, 1, 1], [64, 1, 1], 0x20), Some(([84, 1, 1], [5348, 0, 0])));
+        // A whole number of groups needs no count.
+        assert_eq!(dispatch_dimensions([128, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], [0; 3])));
+        assert_eq!(dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], [10, 0, 5])));
+        // No thread along an axis: nothing runs.
+        assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
     }
 }
