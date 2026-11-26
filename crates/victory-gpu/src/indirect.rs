@@ -51,11 +51,6 @@ cbuffer Record : register(b0) {
     // Bit 3: dispatch records spread across z past 65,535 groups in x
     // (`crate::draw`'s spread command signature): record i goes to byte
     // 20 * i as [row, asked x, x, y, z], row 0 when not spread.
-    // Bit 4 (with bit 3): lean spread layout: plain [x, y, z] records
-    // (12 bytes each) at offset 0; an 8-byte predication word at
-    // `pred_off = (records * 12 + 7) & ~7` (0 if no active record needs
-    // spreading, 1 otherwise); and [row, asked x, x, y, z] records
-    // (20 bytes each) at `pred_off + 8`.
     uint has_count;
     uint count_offset;
     // The first record this dispatch clamps: the caller dispatches one group
@@ -84,10 +79,6 @@ static const uint GROUPS = 1u << 20;
 // which no barrier orders: see the note where the records charge.
 groupshared uint largest_asked;
 groupshared uint all_asked;
-groupshared uint spread_over;
-groupshared uint spread_under;
-groupshared uint spread_extra;
-groupshared uint spread_any;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
@@ -111,10 +102,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     uint dst_at = index * stride;
     bool spread = (has_count & 8u) != 0;
-    bool spread_lean = spread && ((has_count & 16u) != 0);
     uint row = 0;
     uint asked_x = 0;
-    if (spread && !spread_lean) {
+    if (spread) {
         dst_at = index * 20u;
     }
     uint cost = 0;
@@ -124,10 +114,6 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
-        spread_over = 0;
-        spread_under = 0;
-        spread_extra = 0;
-        spread_any = 0;
     }
     if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -200,20 +186,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     GroupMemoryBarrierWithGroupSync();
     if (active && kind >= 2) {
         // Diagnostics, in the budget buffer's next words (below): the
-        // largest group count a mesh or compute record asked for, the
-        // groups asked in all, and for spread-eligible compute records:
-        // counts over/under 65,535 plus extra groups above 65,535.
+        // largest group count a mesh or compute record asked for, and the
+        // groups asked in all.
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
-        if (spread) {
-            if (row != 0u) {
-                InterlockedAdd(spread_over, 1u, was);
-                InterlockedAdd(spread_extra, min(asked_x - 65535u, 1u << 24), was);
-            } else {
-                InterlockedAdd(spread_under, 1u, was);
-            }
-        }
     }
     // Every record charges the budget on its own, in lane order within the
     // group. The caller runs one group per 64 records with a barrier between
@@ -238,30 +215,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         over = before >= BUDGET || BUDGET - before < cost;
     }
-    if (active && spread_lean && row != 0u && !over) {
-        uint was;
-        InterlockedOr(spread_any, 1u, was);
-    }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0) {
-        if (kind >= 2 && base < eff_count) {
-            uint was;
-            budget.InterlockedMax(4, largest_asked, was);
-            budget.InterlockedAdd(8, all_asked, was);
-            if (spread) {
-                budget.InterlockedAdd(12, spread_over, was);
-                budget.InterlockedAdd(16, spread_under, was);
-                budget.InterlockedAdd(20, spread_extra, was);
-            }
-        }
-        if (spread_lean) {
-            uint pred_off = (records * 12u + 7u) & ~7u;
-            if (base == 0u) {
-                dst_args.Store2(pred_off, uint2(spread_any != 0u ? 1u : 0u, 0u));
-            } else if (spread_any != 0u) {
-                dst_args.Store(pred_off, 1u);
-            }
-        }
+    if (gi == 0 && kind >= 2 && base < eff_count) {
+        uint was;
+        budget.InterlockedMax(4, largest_asked, was);
+        budget.InterlockedAdd(8, all_asked, was);
     }
     if (!active) {
         return;
@@ -277,24 +235,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
-            row = 0;
-            asked_x = 0;
         }
-        if (spread_lean) {
-            uint pred_off = (records * 12u + 7u) & ~7u;
-            uint spread_off = pred_off + 8u;
-            uint plain_at = index * 12u;
-            uint spread_at = spread_off + index * 20u;
-            if (row != 0u) {
-                dst_args.Store3(plain_at, uint3(0u, 0u, 0u));
-                dst_args.Store2(spread_at, uint2(row, asked_x));
-                dst_args.Store3(spread_at + 8u, groups);
-            } else {
-                dst_args.Store3(plain_at, groups);
-                dst_args.Store2(spread_at, uint2(0u, 0u));
-                dst_args.Store3(spread_at + 8u, uint3(0u, 0u, 0u));
-            }
-        } else if (spread) {
+        if (spread) {
             dst_args.Store2(dst_at, uint2(row, asked_x));
             dst_args.Store3(dst_at + 8u, groups);
         } else {
@@ -440,50 +382,6 @@ pub(crate) fn bound(
     clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
 }
 
-/// Layout offsets inside the scratch buffer for `spread_lean` mode:
-/// `(pred_off, spread_off, total_bytes)`.
-pub(crate) fn spread_lean_layout(records: u32) -> Option<(u64, u64, u64)> {
-    let n = u64::from(records.max(1));
-    let pred_off = n.checked_mul(12)?.next_multiple_of(8);
-    let spread_off = pred_off.checked_add(8)?;
-    let total = spread_off.checked_add(n.checked_mul(20)?)?;
-    (total <= u64::from(u32::MAX)).then_some((pred_off, spread_off, total))
-}
-
-/// [`bound`] for `VICTORY_SPREAD_LEAN`: writes plain `[x, y, z]` records
-/// (`12` bytes each) at offset `0`, an 8-byte predication flag at `pred_off`
-/// (`0` if all active records fit `x <= 65,535`, `1` if any needs spreading),
-/// and `[row, asked_x, x, y, z]` records (`20` bytes each) at `spread_off`.
-pub(crate) fn bound_spread_lean(
-    list: &HostList,
-    src: (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
-    spec: (u32, u32, u32),
-) -> Option<(ID3D12Resource, u64, u64)> {
-    let _ = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (pred_off, spread_off, total) = spread_lean_layout(spec.2)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(total)?);
-    let before = list.indirect_state(&dst);
-    let recorded = record_clamp_mode(
-        c,
-        &list.list,
-        (&dst, before),
-        budget,
-        src,
-        count,
-        spec,
-        false,
-        2,
-        true,
-    );
-    if recorded {
-        list.indirect_readable(&dst);
-        Some((dst, pred_off, spread_off))
-    } else {
-        None
-    }
-}
-
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each
@@ -553,31 +451,13 @@ fn record_clamp_as(
 fn record_clamp_with(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    budget: u64,
-    src: (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
-    spec: (u32, u32, u32),
-    ahead: bool,
-    spread: bool,
-    lean: bool,
-) -> bool {
-    record_clamp_mode(c, l, dst, budget, src, count, spec, ahead, u8::from(spread), lean)
-}
-
-/// [`record_clamp_with`] with `spread_mode`: `0` off, `1` classic spread
-/// (20-byte records), `2` spread-lean (plain + predication + spread).
-#[allow(clippy::too_many_arguments)]
-fn record_clamp_mode(
-    c: &Clamp,
-    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
-    spread_mode: u8,
+    spread: bool,
     lean: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
@@ -623,17 +503,12 @@ fn record_clamp_mode(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let spread_bits = if kind == 2 {
-        (u32::from(spread_mode >= 1) << 3) | (u32::from(spread_mode >= 2) << 4)
-    } else {
-        0
-    };
     let constants = [
         kind,
         stride,
         records,
         args_offset,
-        has_count | (u32::from(ahead) << 1) | spread_bits,
+        has_count | (u32::from(ahead) << 1) | (u32::from(spread && kind == 2) << 3),
         count_offset,
         0,
     ];
@@ -1798,347 +1673,6 @@ void main() {
         assert_eq!(&out[0..5], &[57_600, 115_200, 57_600, 1, 2], "115,200 x 1 x 1: spread");
         assert_eq!(&out[5..10], &[0, 100, 100, 2, 1], "100 x 2 x 1: not spread");
         assert_eq!(&out[10..15], &[32_769, 65_537, 32_769, 1, 2], "65,537 x 1 x 1: spread");
-    }
-
-    #[test]
-    fn warp_spread_lean_routes_small_and_large_records_and_counts_them() {
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
-        };
-        const KIND_DISPATCH: u32 = 2;
-        const STRIDE: u32 = 12;
-
-        // Batch 1: mixed small + large + boundary 65,535.
-        let mixed: [[u32; 3]; 3] = [[100, 2, 1], [100_000, 1, 1], [65_535, 1, 1]];
-        let (pred_off, spread_off, total) = spread_lean_layout(mixed.len() as u32).unwrap();
-        assert_eq!((pred_off, spread_off), (40, 48));
-        let (src_buf, src_ptr, _) = warp.shared_buffer(4096);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (readback_buf, readback_ptr, _) = warp.shared_buffer(4096);
-        let dst_buf = warp.default_uav(4096);
-        // SAFETY: buffers mapped with the capacities above.
-        unsafe {
-            for (i, r) in mixed.iter().enumerate() {
-                for (w, v) in r.iter().enumerate() {
-                    (src_ptr as *mut u32).add(i * 3 + w).write_volatile(*v);
-                }
-            }
-            std::ptr::write_bytes(budget_ptr, 0, 256);
-            std::ptr::write_bytes(readback_ptr, 0, 4096);
-        }
-        assert!(record_clamp_mode(
-            &warp.clamp,
-            &warp.list,
-            (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
-            (&src_buf, 0),
-            None,
-            (KIND_DISPATCH, STRIDE, mixed.len() as u32),
-            false,
-            2,
-            false,
-        ));
-        // SAFETY: open command list; clamp left `dst_buf` in `INDIRECT_ARGUMENT`.
-        unsafe {
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total);
-        }
-        warp.submit_and_wait();
-        // SAFETY: GPU work complete; mapped host buffers.
-        let (out, budget_words) = unsafe {
-            (
-                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), (total / 4) as usize).to_vec(),
-                std::slice::from_raw_parts(budget_ptr.cast::<u32>().cast_const(), 6).to_vec(),
-            )
-        };
-        assert_eq!(&out[0..3], &[100, 2, 1], "small record goes to plain");
-        assert_eq!(&out[3..6], &[0, 0, 0], "large record is zeroed in plain");
-        assert_eq!(&out[6..9], &[65_535, 1, 1], "65,535 boundary goes to plain");
-        assert_eq!(&out[10..12], &[1, 0], "predication word non-zero on mixed batch");
-        assert_eq!(&out[12..17], &[0, 0, 0, 0, 0], "small record is zeroed in spread");
-        assert_eq!(&out[17..22], &[50_000, 100_000, 50_000, 1, 2], "100k goes to spread");
-        assert_eq!(&out[22..27], &[0, 0, 0, 0, 0], "65,535 is zeroed in spread");
-        assert_eq!(budget_words[3], 1, "spread_over");
-        assert_eq!(budget_words[4], 2, "spread_under");
-        assert_eq!(budget_words[5], 34_465, "spread_extra");
-
-        // Batch 2: all-small batch resets `pred_off` to 0 even when reusing `dst_buf` cleanly.
-        let small: [[u32; 3]; 2] = [[100, 2, 1], [256, 1, 1]];
-        let (pred_off_s, _, total_s) = spread_lean_layout(small.len() as u32).unwrap();
-        assert_eq!(pred_off_s, 24);
-        // SAFETY: buffers mapped with the capacities above.
-        unsafe {
-            for (i, r) in small.iter().enumerate() {
-                for (w, v) in r.iter().enumerate() {
-                    (src_ptr as *mut u32).add(i * 3 + w).write_volatile(*v);
-                }
-            }
-            std::ptr::write_bytes(budget_ptr, 0, 256);
-            std::ptr::write_bytes(readback_ptr, 0, 4096);
-        }
-        assert!(record_clamp_mode(
-            &warp.clamp,
-            &warp.list,
-            (&dst_buf, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            budget_gpu,
-            (&src_buf, 0),
-            None,
-            (KIND_DISPATCH, STRIDE, small.len() as u32),
-            false,
-            2,
-            false,
-        ));
-        // SAFETY: open command list.
-        unsafe {
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_s);
-        }
-        warp.submit_and_wait();
-        // SAFETY: GPU work complete.
-        let (out_s, budget_s) = unsafe {
-            (
-                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), (total_s / 4) as usize).to_vec(),
-                std::slice::from_raw_parts(budget_ptr.cast::<u32>().cast_const(), 6).to_vec(),
-            )
-        };
-        assert_eq!(&out_s[0..6], &[100, 2, 1, 256, 1, 1]);
-        assert_eq!(&out_s[6..8], &[0, 0], "predication word zeroed on all-small batch");
-        assert_eq!(budget_s[3], 0, "spread_over");
-        assert_eq!(budget_s[4], 2, "spread_under");
-        assert_eq!(budget_s[5], 0, "spread_extra");
-
-        // Batch 3: > 64 records where only chunk 1 (index 68) needs spreading.
-        let count_many: u32 = 70;
-        let (pred_off_m, _, total_m) = spread_lean_layout(count_many).unwrap();
-        // SAFETY: buffers mapped with the capacities above.
-        unsafe {
-            for i in 0..count_many as usize {
-                let x = if i == 68 { 70_000 } else { 8 };
-                (src_ptr as *mut u32).add(i * 3).write_volatile(x);
-                (src_ptr as *mut u32).add(i * 3 + 1).write_volatile(1);
-                (src_ptr as *mut u32).add(i * 3 + 2).write_volatile(1);
-            }
-            std::ptr::write_bytes(budget_ptr, 0, 256);
-            std::ptr::write_bytes(readback_ptr, 0, 4096);
-        }
-        assert!(record_clamp_mode(
-            &warp.clamp,
-            &warp.list,
-            (&dst_buf, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            budget_gpu,
-            (&src_buf, 0),
-            None,
-            (KIND_DISPATCH, STRIDE, count_many),
-            false,
-            2,
-            false,
-        ));
-        // SAFETY: open command list.
-        unsafe {
-            warp.list.ResourceBarrier(&[transition(
-                &dst_buf,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
-            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_m);
-        }
-        warp.submit_and_wait();
-        // SAFETY: GPU work complete.
-        let (out_m, budget_m) = unsafe {
-            (
-                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), (total_m / 4) as usize).to_vec(),
-                std::slice::from_raw_parts(budget_ptr.cast::<u32>().cast_const(), 6).to_vec(),
-            )
-        };
-        let pred_idx = (pred_off_m / 4) as usize;
-        assert_eq!(&out_m[pred_idx..pred_idx + 2], &[1, 0], "second chunk sets predication flag");
-        assert_eq!(budget_m[3], 1, "spread_over");
-        assert_eq!(budget_m[4], 69, "spread_under");
-        assert_eq!(budget_m[5], 70_000 - 65_535, "spread_extra");
-    }
-
-    #[test]
-    fn warp_spread_lean_executes_same_group_ids_as_spread_for_100k_groups() {
-        let Some(mut warp) = WarpHarness::new() else {
-            return;
-        };
-        const SHADER: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
-cbuffer Spread : register(b0) { uint row; uint asked_x; };
-RWByteAddressBuffer out_buf : register(u0);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main(uint3 gid : SV_GroupID) {
-    uint eff_x = row != 0 ? (gid.x + gid.z * row) : gid.x;
-    if (row != 0 && eff_x >= asked_x) return;
-    uint was;
-    out_buf.InterlockedMax(0, eff_x, was);
-    out_buf.InterlockedAdd(4, 1u, was);
-}
-"#;
-        let cs = crate::host::compile(SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1")).unwrap();
-        // SAFETY: WARP device and open command list in `WarpHarness`.
-        let (root, pso, plain_sig, spread_sig) = unsafe {
-            let root: ID3D12RootSignature = warp.device.CreateRootSignature(0, &cs[..]).unwrap();
-            let pso: ID3D12PipelineState = warp
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: cs.as_ptr().cast(),
-                        BytecodeLength: cs.len(),
-                    },
-                    ..Default::default()
-                })
-                .unwrap();
-            let plain_arg = D3D12_INDIRECT_ARGUMENT_DESC {
-                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-                ..Default::default()
-            };
-            let mut plain_sig: Option<ID3D12CommandSignature> = None;
-            warp.device
-                .CreateCommandSignature(
-                    &D3D12_COMMAND_SIGNATURE_DESC {
-                        ByteStride: 12,
-                        NumArgumentDescs: 1,
-                        pArgumentDescs: &plain_arg,
-                        NodeMask: 0,
-                    },
-                    None::<&ID3D12RootSignature>,
-                    &mut plain_sig,
-                )
-                .unwrap();
-            let spread_args = [
-                D3D12_INDIRECT_ARGUMENT_DESC {
-                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
-                    Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
-                        Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
-                            RootParameterIndex: 0,
-                            DestOffsetIn32BitValues: 0,
-                            Num32BitValuesToSet: 2,
-                        },
-                    },
-                },
-                D3D12_INDIRECT_ARGUMENT_DESC {
-                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-                    ..Default::default()
-                },
-            ];
-            let mut spread_sig: Option<ID3D12CommandSignature> = None;
-            warp.device
-                .CreateCommandSignature(
-                    &D3D12_COMMAND_SIGNATURE_DESC {
-                        ByteStride: 20,
-                        NumArgumentDescs: 2,
-                        pArgumentDescs: spread_args.as_ptr(),
-                        NodeMask: 0,
-                    },
-                    Some(&root),
-                    &mut spread_sig,
-                )
-                .unwrap();
-            (root, pso, plain_sig.unwrap(), spread_sig.unwrap())
-        };
-
-        let (src_buf, src_ptr, _) = warp.shared_buffer(256);
-        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
-        let (zero_buf, zero_ptr, _) = warp.shared_buffer(256);
-        let (readback_buf, readback_ptr, _) = warp.shared_buffer(256);
-        let out_buf = warp.default_uav(256);
-        let dst_buf = warp.default_uav(256);
-        let (pred_off, spread_off, _) = spread_lean_layout(1).unwrap();
-
-        let mut run_case = |groups_x: u32, dst_initial: D3D12_RESOURCE_STATES| -> (u32, u32, u64) {
-            // SAFETY: mapped host buffers and open command list.
-            unsafe {
-                (src_ptr as *mut u32).write_volatile(groups_x);
-                (src_ptr as *mut u32).add(1).write_volatile(1);
-                (src_ptr as *mut u32).add(2).write_volatile(1);
-                std::ptr::write_bytes(budget_ptr, 0, 256);
-                std::ptr::write_bytes(zero_ptr, 0, 256);
-                std::ptr::write_bytes(readback_ptr, 0, 256);
-                warp.list.ResourceBarrier(&[transition(
-                    &out_buf,
-                    if dst_initial == D3D12_RESOURCE_STATE_COMMON {
-                        D3D12_RESOURCE_STATE_COMMON
-                    } else {
-                        D3D12_RESOURCE_STATE_COPY_SOURCE
-                    },
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                )]);
-                warp.list.CopyBufferRegion(&out_buf, 0, &zero_buf, 0, 16);
-                warp.list.ResourceBarrier(&[transition(
-                    &out_buf,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                )]);
-            }
-            assert!(record_clamp_mode(
-                &warp.clamp,
-                &warp.list,
-                (&dst_buf, dst_initial),
-                budget_gpu,
-                (&src_buf, 0),
-                None,
-                (2, 12, 1),
-                false,
-                2,
-                false,
-            ));
-            // SAFETY: open command list; `dst_buf` is in `INDIRECT_ARGUMENT | PREDICATION`.
-            unsafe {
-                warp.list.SetComputeRootSignature(&root);
-                warp.list.SetPipelineState(&pso);
-                let zeros = [0u32, 0u32];
-                warp.list.SetComputeRoot32BitConstants(0, 2, zeros.as_ptr().cast(), 0);
-                warp.list.SetComputeRootUnorderedAccessView(1, out_buf.GetGPUVirtualAddress());
-                warp.list.ExecuteIndirect(&plain_sig, 1, &dst_buf, 0, None, 0);
-                warp.list
-                    .SetPredication(Some(&dst_buf), pred_off, D3D12_PREDICATION_OP_EQUAL_ZERO);
-                warp.list
-                    .ExecuteIndirect(&spread_sig, 1, &dst_buf, spread_off, None, 0);
-                warp.list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-                warp.list.ResourceBarrier(&[
-                    transition(
-                        &out_buf,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ),
-                    transition(
-                        &dst_buf,
-                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    ),
-                ]);
-                warp.list.CopyBufferRegion(&readback_buf, 0, &out_buf, 0, 8);
-                warp.list.CopyBufferRegion(&readback_buf, 16, &dst_buf, pred_off, 8);
-            }
-            warp.submit_and_wait();
-            // SAFETY: GPU work complete; readback buffer mapped.
-            unsafe {
-                let p = readback_ptr.cast::<u32>().cast_const();
-                let pred = readback_ptr.add(16).cast::<u64>().cast_const().read_volatile();
-                (p.read_volatile(), p.add(1).read_volatile(), pred)
-            }
-        };
-
-        let (max_x_100k, ran_100k, pred_100k) = run_case(100_000, D3D12_RESOURCE_STATE_COMMON);
-        assert_eq!(max_x_100k, 99_999, "100k spread max eff_x");
-        assert_eq!(ran_100k, 100_000, "100k spread executed group count");
-        assert_ne!(pred_100k, 0, "100k sets predication non-zero");
-
-        let (max_x_100, ran_100, pred_100) = run_case(100, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        assert_eq!(max_x_100, 99, "100 plain max eff_x");
-        assert_eq!(ran_100, 100, "100 plain executed group count");
-        assert_eq!(pred_100, 0, "100 keeps predication zero");
     }
 
     /// WARP D3D12 execution test proving:
@@ -3769,338 +3303,5 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
-    }
-
-    #[test]
-    #[ignore = "a measurement on the card: run it by name with --ignored --nocapture"]
-    fn spread_signature_cost() {
-        let Some(mut rig) = Rig::new() else {
-            eprintln!("no hardware adapter, or our shaders did not compile; skipped");
-            return;
-        };
-        const SPREAD_WORK: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
-cbuffer Spread : register(b0) { uint row; uint asked_x; };
-RWByteAddressBuffer words : register(u0);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void work_a(uint3 gid : SV_GroupID) {
-    uint gx = row != 0 ? (gid.x + gid.z * row) : gid.x;
-    if (row != 0 && gx >= asked_x) return;
-    words.Store(0, words.Load(0) + 1 + gx);
-}
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void work_b(uint3 gid : SV_GroupID) {
-    uint gx = row != 0 ? (gid.x + gid.z * row) : gid.x;
-    if (row != 0 && gx >= asked_x) return;
-    words.Store(4, words.Load(4) + 1 + gx);
-}
-"#;
-        const N: usize = 1000;
-        let cs_a = compile(SPREAD_WORK, s!("work_a"), s!("cs_5_1")).unwrap();
-        let cs_b = compile(SPREAD_WORK, s!("work_b"), s!("cs_5_1")).unwrap();
-        // SAFETY: local rig objects on a hardware adapter.
-        let (
-            root,
-            pso_a,
-            pso_b,
-            plain_sig,
-            spread_sig,
-            plain_args,
-            spread_args,
-            zero_buf,
-            _up_plain,
-            _up_spread,
-            _up_zero,
-        ) = unsafe {
-            let mut device: Option<ID3D12Device> = None;
-            rig.queue.GetDevice(&mut device).unwrap();
-            let device = device.unwrap();
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &cs_a[..]).unwrap();
-            let make_pso = |bytes: &[u8]| -> ID3D12PipelineState {
-                device
-                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                        pRootSignature: std::mem::transmute_copy(&root),
-                        CS: D3D12_SHADER_BYTECODE {
-                            pShaderBytecode: bytes.as_ptr().cast(),
-                            BytecodeLength: bytes.len(),
-                        },
-                        ..Default::default()
-                    })
-                    .unwrap()
-            };
-            let pso_a = make_pso(&cs_a);
-            let pso_b = make_pso(&cs_b);
-
-            let plain_arg = D3D12_INDIRECT_ARGUMENT_DESC {
-                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-                ..Default::default()
-            };
-            let mut plain_sig: Option<ID3D12CommandSignature> = None;
-            device
-                .CreateCommandSignature(
-                    &D3D12_COMMAND_SIGNATURE_DESC {
-                        ByteStride: 12,
-                        NumArgumentDescs: 1,
-                        pArgumentDescs: &plain_arg,
-                        NodeMask: 0,
-                    },
-                    None::<&ID3D12RootSignature>,
-                    &mut plain_sig,
-                )
-                .unwrap();
-
-            let spread_args_desc = [
-                D3D12_INDIRECT_ARGUMENT_DESC {
-                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
-                    Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
-                        Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
-                            RootParameterIndex: 0,
-                            DestOffsetIn32BitValues: 0,
-                            Num32BitValuesToSet: 2,
-                        },
-                    },
-                },
-                D3D12_INDIRECT_ARGUMENT_DESC {
-                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-                    ..Default::default()
-                },
-            ];
-            let mut spread_sig: Option<ID3D12CommandSignature> = None;
-            device
-                .CreateCommandSignature(
-                    &D3D12_COMMAND_SIGNATURE_DESC {
-                        ByteStride: 20,
-                        NumArgumentDescs: 2,
-                        pArgumentDescs: spread_args_desc.as_ptr(),
-                        NodeMask: 0,
-                    },
-                    Some(&root),
-                    &mut spread_sig,
-                )
-                .unwrap();
-
-            let up_plain = buffer(
-                &device,
-                (N * 12) as u64,
-                D3D12_HEAP_TYPE_UPLOAD,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-            );
-            let mut p = std::ptr::null_mut();
-            up_plain.Map(0, None, Some(&mut p)).unwrap();
-            let s_plain = std::slice::from_raw_parts_mut(p.cast::<u32>(), N * 3);
-            for i in 0..N {
-                s_plain[i * 3] = 1;
-                s_plain[i * 3 + 1] = 1;
-                s_plain[i * 3 + 2] = 1;
-            }
-            up_plain.Unmap(0, None);
-
-            let up_spread = buffer(
-                &device,
-                (N * 20) as u64,
-                D3D12_HEAP_TYPE_UPLOAD,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-            );
-            let mut p = std::ptr::null_mut();
-            up_spread.Map(0, None, Some(&mut p)).unwrap();
-            let s_spread = std::slice::from_raw_parts_mut(p.cast::<u32>(), N * 5);
-            for i in 0..N {
-                s_spread[i * 5] = 0;
-                s_spread[i * 5 + 1] = 0;
-                s_spread[i * 5 + 2] = 1;
-                s_spread[i * 5 + 3] = 1;
-                s_spread[i * 5 + 4] = 1;
-            }
-            up_spread.Unmap(0, None);
-
-            let up_zero = buffer(
-                &device,
-                (N * 8) as u64,
-                D3D12_HEAP_TYPE_UPLOAD,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-            );
-            let mut p = std::ptr::null_mut();
-            up_zero.Map(0, None, Some(&mut p)).unwrap();
-            std::ptr::write_bytes(p, 0, N * 8);
-            up_zero.Unmap(0, None);
-
-            let plain_args = buffer(
-                &device,
-                (N * 12) as u64,
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            );
-            let spread_args = buffer(
-                &device,
-                (N * 20) as u64,
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            );
-            let zero_buf = buffer(
-                &device,
-                (N * 8) as u64,
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            );
-
-            rig.list.CopyBufferRegion(&plain_args, 0, &up_plain, 0, (N * 12) as u64);
-            rig.list.CopyBufferRegion(&spread_args, 0, &up_spread, 0, (N * 20) as u64);
-            rig.list.CopyBufferRegion(&zero_buf, 0, &up_zero, 0, (N * 8) as u64);
-            rig.list.ResourceBarrier(&[
-                transition(&plain_args, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-                transition(&spread_args, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-                transition(
-                    &zero_buf,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT | D3D12_RESOURCE_STATE_PREDICATION,
-                ),
-            ]);
-            rig.finish();
-
-            (
-                root,
-                pso_a,
-                pso_b,
-                plain_sig.unwrap(),
-                spread_sig.unwrap(),
-                plain_args,
-                spread_args,
-                zero_buf,
-                up_plain,
-                up_spread,
-                up_zero,
-            )
-        };
-
-        #[derive(Clone, Copy)]
-        enum Mode {
-            Plain,
-            Spread,
-            SpreadCount0,
-            PlainPlusPredicatedSpread,
-            PlainPlusCount0Spread,
-        }
-
-        let card = rig.card.clone();
-        let mut measure = |mode: Mode, alt_pso: bool, batched: bool| -> (f64, f64) {
-            let started = std::time::Instant::now();
-            // SAFETY: open command list with initialized buffers, signatures, and PSOs.
-            unsafe {
-                let l = &rig.list;
-                l.EndQuery(&rig.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
-                l.SetComputeRootSignature(&root);
-                l.SetPipelineState(&pso_a);
-                let zeros = [0u32, 0u32];
-                l.SetComputeRoot32BitConstants(0, 2, zeros.as_ptr().cast(), 0);
-                l.SetComputeRootUnorderedAccessView(1, rig.words.GetGPUVirtualAddress());
-                if batched {
-                    match mode {
-                        Mode::Plain => l.ExecuteIndirect(&plain_sig, N as u32, &plain_args, 0, None, 0),
-                        Mode::Spread => l.ExecuteIndirect(&spread_sig, N as u32, &spread_args, 0, None, 0),
-                        Mode::SpreadCount0 => {
-                            l.ExecuteIndirect(&spread_sig, N as u32, &spread_args, 0, Some(&zero_buf), 0)
-                        }
-                        Mode::PlainPlusPredicatedSpread => {
-                            l.ExecuteIndirect(&plain_sig, N as u32, &plain_args, 0, None, 0);
-                            l.SetPredication(Some(&zero_buf), 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-                            l.ExecuteIndirect(&spread_sig, N as u32, &spread_args, 0, None, 0);
-                            l.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-                        }
-                        Mode::PlainPlusCount0Spread => {
-                            l.ExecuteIndirect(&plain_sig, N as u32, &plain_args, 0, None, 0);
-                            l.ExecuteIndirect(&spread_sig, N as u32, &spread_args, 0, Some(&zero_buf), 0);
-                        }
-                    }
-                } else {
-                    for i in 0..N {
-                        if alt_pso {
-                            l.SetPipelineState(if i % 2 == 0 { &pso_a } else { &pso_b });
-                        }
-                        let po = (i * 12) as u64;
-                        let so = (i * 20) as u64;
-                        let zo = (i * 8) as u64;
-                        match mode {
-                            Mode::Plain => l.ExecuteIndirect(&plain_sig, 1, &plain_args, po, None, 0),
-                            Mode::Spread => l.ExecuteIndirect(&spread_sig, 1, &spread_args, so, None, 0),
-                            Mode::SpreadCount0 => {
-                                l.ExecuteIndirect(&spread_sig, 1, &spread_args, so, Some(&zero_buf), zo)
-                            }
-                            Mode::PlainPlusPredicatedSpread => {
-                                l.ExecuteIndirect(&plain_sig, 1, &plain_args, po, None, 0);
-                                l.SetPredication(Some(&zero_buf), zo, D3D12_PREDICATION_OP_EQUAL_ZERO);
-                                l.ExecuteIndirect(&spread_sig, 1, &spread_args, so, None, 0);
-                                l.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-                            }
-                            Mode::PlainPlusCount0Spread => {
-                                l.ExecuteIndirect(&plain_sig, 1, &plain_args, po, None, 0);
-                                l.ExecuteIndirect(&spread_sig, 1, &spread_args, so, Some(&zero_buf), zo);
-                            }
-                        }
-                    }
-                }
-                l.EndQuery(&rig.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
-                l.ResolveQueryData(&rig.stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &rig.back, 0);
-            }
-            let rec_ms = started.elapsed().as_secs_f64() * 1e3;
-            rig.finish();
-            let mut data = std::ptr::null_mut();
-            let range = D3D12_RANGE { Begin: 0, End: 16 };
-            // SAFETY: timestamp query result buffer.
-            let ticks = unsafe {
-                rig.back.Map(0, Some(&range), Some(&mut data)).unwrap();
-                let stamps = std::slice::from_raw_parts(data.cast::<u64>(), 2).to_vec();
-                rig.back.Unmap(0, None);
-                stamps[1].saturating_sub(stamps[0])
-            };
-            // SAFETY: plain queue query.
-            let frequency = unsafe { rig.queue.GetTimestampFrequency() }.unwrap_or(1).max(1);
-            (ticks as f64 * 1e3 / frequency as f64, rec_ms)
-        };
-
-        eprintln!("spread signature cost on {card}: N={N} dispatches, 5 runs each (min/median GPU ms)");
-        // Warmup all modes.
-        for mode in [
-            Mode::Plain,
-            Mode::Spread,
-            Mode::SpreadCount0,
-            Mode::PlainPlusPredicatedSpread,
-            Mode::PlainPlusCount0Spread,
-        ] {
-            measure(mode, false, false);
-        }
-
-        let cases = [
-            ("1x1000 plain (same PSO)", Mode::Plain, false, false),
-            ("1x1000 spread (same PSO)", Mode::Spread, false, false),
-            ("1x1000 spread_count0 (same PSO)", Mode::SpreadCount0, false, false),
-            ("1x1000 plain+predicated_spread (same PSO)", Mode::PlainPlusPredicatedSpread, false, false),
-            ("1x1000 plain+count0_spread (same PSO)", Mode::PlainPlusCount0Spread, false, false),
-            ("1x1000 plain (alt 2 PSOs)", Mode::Plain, true, false),
-            ("1x1000 spread (alt 2 PSOs)", Mode::Spread, true, false),
-            ("1x1000 spread_count0 (alt 2 PSOs)", Mode::SpreadCount0, true, false),
-            ("1x1000 plain+predicated_spread (alt 2 PSOs)", Mode::PlainPlusPredicatedSpread, true, false),
-            ("1x1000 plain+count0_spread (alt 2 PSOs)", Mode::PlainPlusCount0Spread, true, false),
-            ("batched max=1000 plain", Mode::Plain, false, true),
-            ("batched max=1000 spread", Mode::Spread, false, true),
-            ("batched max=1000 spread_count0", Mode::SpreadCount0, false, true),
-            ("batched max=1000 plain+predicated_spread", Mode::PlainPlusPredicatedSpread, false, true),
-            ("batched max=1000 plain+count0_spread", Mode::PlainPlusCount0Spread, false, true),
-        ];
-        for (name, mode, alt_pso, batched) in cases {
-            let mut runs: Vec<(f64, f64)> = (0..5).map(|_| measure(mode, alt_pso, batched)).collect();
-            runs.sort_by(|a, b| a.0.total_cmp(&b.0));
-            eprintln!(
-                "{name}: min={:.3} ms, med={:.3} ms (all: {:.3}, {:.3}, {:.3}, {:.3}, {:.3}); rec={:.2} ms",
-                runs[0].0, runs[2].0, runs[0].0, runs[1].0, runs[2].0, runs[3].0, runs[4].0, runs[2].1
-            );
-        }
     }
 }
