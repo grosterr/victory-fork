@@ -179,16 +179,207 @@ fn mirror(handle: u64) {
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
+/// Maximum contiguous dirty byte run read in a single `read_into` call before
+/// splitting across `watch::PAGE`-aligned chunks for parallel processing
+/// (128 KiB = 2 × 64 KiB watched blocks, balancing syscall coalescing with worker fan-out).
+#[cfg(windows)]
+const SYNC_CHUNK_BYTES: usize = 128 << 10;
+
+/// One contiguous dirty byte slice inside a shader-visible heap for [`sync_heaps`].
+#[cfg(windows)]
+struct SyncChunk {
+    heap_ptr: usize,
+    start: u64,
+    step: u64,
+    mirrored_count: u32,
+    from: usize,
+    to: usize,
+}
+
+/// Shared totals accumulated across [`sync_heaps`] worker batches.
+#[cfg(windows)]
+#[derive(Default)]
+struct SyncTotals {
+    pages: std::sync::atomic::AtomicU64,
+    looked: std::sync::atomic::AtomicU64,
+    mirrored: std::sync::atomic::AtomicU64,
+    read_us: std::sync::atomic::AtomicU64,
+    walk_us: std::sync::atomic::AtomicU64,
+    make_us: std::sync::atomic::AtomicU64,
+}
+
+/// Merges touching or overlapping dirty `[from, to)` byte ranges without bridging gaps.
+#[cfg(windows)]
+fn coalesce_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|&(from, to)| from < to);
+    if ranges.len() > 1 {
+        ranges.sort_unstable_by_key(|&(from, _)| from);
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        if let Some(last) = merged.last_mut()
+            && from <= last.1
+        {
+            last.1 = last.1.max(to);
+        } else {
+            merged.push((from, to));
+        }
+    }
+    merged
+}
+
+/// Splits coalesced dirty byte ranges into page-aligned chunks of at most `max_bytes`.
+#[cfg(windows)]
+fn chunk_ranges(ranges: &[(usize, usize)], max_bytes: usize) -> Vec<(usize, usize)> {
+    let max_bytes = max_bytes.max(crate::watch::PAGE);
+    let mut out = Vec::new();
+    for &(from, end) in ranges {
+        let mut pos = from;
+        while pos < end {
+            let bound = (pos & !(crate::watch::PAGE - 1)).saturating_add(max_bytes);
+            let to = bound.min(end);
+            out.push((pos, to));
+            pos = to;
+        }
+    }
+    out
+}
+
+/// Number of `PAGE`-sized pages covered by `[from, to)`.
+#[cfg(windows)]
+fn pages_spanned(from: usize, to: usize) -> u64 {
+    if from >= to {
+        return 0;
+    }
+    let first_page = from & !(crate::watch::PAGE - 1);
+    let last_page = (to - 1) & !(crate::watch::PAGE - 1);
+    ((last_page - first_page) / crate::watch::PAGE + 1) as u64
+}
+
+/// Mirrors the dirty descriptor records inside one copied byte slice `[from, to)`.
+#[cfg(windows)]
+fn mirror_range(
+    host: &host::HostHeap,
+    chunk: &SyncChunk,
+    from: usize,
+    bytes: &[u8],
+    use_page_at_once: bool,
+    epochs: Option<&[u64; 64]>,
+) -> (u64, u64, u64, u64) {
+    let to = from + bytes.len();
+    let slots = changed_slots(from, to, chunk.start as usize, chunk.step, chunk.mirrored_count);
+    if use_page_at_once {
+        return host.mirror_copied_slice(slots, (chunk.start, chunk.step), from, bytes, epochs);
+    }
+    let started = std::time::Instant::now();
+    let (mut looked, mut mirrored) = (0u64, 0u64);
+    for index in slots {
+        let handle = chunk.start + index * chunk.step;
+        // A record that straddles the range's ends is left to the range that
+        // holds its first byte.
+        let Some(at) = (handle as usize).checked_sub(from) else {
+            continue;
+        };
+        let Some(record) = bytes.get(at..at + chunk.step as usize) else {
+            continue;
+        };
+        looked += 1;
+        // Only a record that is not the one last seen there (`HostHeap::mirror_copied`).
+        let expected_epoch = epochs.map(|e| e[(index as usize) % e.len()]);
+        if host.mirror_copied(index as u32, handle, record, expected_epoch) {
+            mirrored += 1;
+        }
+    }
+    (looked, mirrored, 0, started.elapsed().as_micros() as u64)
+}
+
+/// Processes a batch of [`SyncChunk`]s with a caller-supplied `read_fn`, falling
+/// back to per-page reads across a chunk if its coalesced read returns `false`.
+#[cfg(windows)]
+fn process_sync_batch<F>(chunks: &[SyncChunk], read_fn: F, use_page_at_once: bool, totals: &SyncTotals)
+where
+    F: Fn(*const u8, &mut [u8]) -> bool,
+{
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut buf: Vec<u8> = Vec::new();
+    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let (mut read_us, mut walk_us, mut make_us) = (0u64, 0u64, 0u64);
+    for chunk in chunks {
+        // SAFETY: `SHADER_HEAPS` read lock stays held across the batch.
+        let heap = unsafe { &*(chunk.heap_ptr as *const Heap) };
+        let Some(Some(host)) = heap.host.get() else {
+            continue;
+        };
+        let len = chunk.to - chunk.from;
+        if len == 0 {
+            continue;
+        }
+        // Coalesced read through the kernel into a reusable copy buffer: a chunk
+        // with an unmapped page inside fails `read_fn`, triggering per-page reads
+        // so valid neighbour pages are still mirrored.
+        buf.resize(len, 0);
+        let epochs = host.made_shard_epochs();
+        let reading = std::time::Instant::now();
+        let read = read_fn(chunk.from as *const u8, &mut buf);
+        read_us += reading.elapsed().as_micros() as u64;
+        if read {
+            pages += pages_spanned(chunk.from, chunk.to);
+            let (s, m, w_us, m_us) = mirror_range(host, chunk, chunk.from, &buf, use_page_at_once, Some(&epochs));
+            looked += s;
+            mirrored += m;
+            walk_us += w_us;
+            make_us += m_us;
+        } else if pages_spanned(chunk.from, chunk.to) > 1 {
+            let mut page = chunk.from & !(crate::watch::PAGE - 1);
+            while page < chunk.to {
+                let pf = page.max(chunk.from);
+                let pt = (page + crate::watch::PAGE).min(chunk.to);
+                let slice = &mut buf[..pt - pf];
+                let page_epochs = host.made_shard_epochs();
+                let reading = std::time::Instant::now();
+                let ok = read_fn(pf as *const u8, slice);
+                read_us += reading.elapsed().as_micros() as u64;
+                if ok {
+                    pages += 1;
+                    let (s, m, w_us, m_us) = mirror_range(host, chunk, pf, slice, use_page_at_once, Some(&page_epochs));
+                    looked += s;
+                    mirrored += m;
+                    walk_us += w_us;
+                    make_us += m_us;
+                }
+                page += crate::watch::PAGE;
+            }
+        }
+    }
+    totals.pages.fetch_add(pages, Relaxed);
+    totals.looked.fetch_add(looked, Relaxed);
+    totals.mirrored.fetch_add(mirrored, Relaxed);
+    totals.read_us.fetch_add(read_us, Relaxed);
+    totals.walk_us.fetch_add(walk_us, Relaxed);
+    totals.make_us.fetch_add(make_us, Relaxed);
+}
+
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
-    use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
+    sync_heaps_with(crate::host::read_into, SYNC_CHUNK_BYTES, page_at_once(), true);
+}
+
+/// Core of [`sync_heaps`], parameterized over `read_fn`, coalesced chunk cap,
+/// per-page-slice toggle, and parallel dispatch so tests and benchmarks can verify
+/// coalescing, fallback, parity, and call counts deterministically.
+#[cfg(windows)]
+fn sync_heaps_with<F>(read_fn: F, chunk_bytes: usize, use_page_at_once: bool, parallel: bool)
+where
+    F: Fn(*const u8, &mut [u8]) -> bool + Send + Sync + Copy + 'static,
+{
+    use std::sync::atomic::Ordering::Relaxed;
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
-    let mut page_bytes: Vec<u8> = Vec::new();
+    let mut chunks: Vec<SyncChunk> = Vec::new();
+    let mut total_bytes = 0usize;
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
@@ -213,55 +404,74 @@ pub(crate) fn sync_heaps() {
         let asking = std::time::Instant::now();
         let ranges = written.take(start as usize, looked_end);
         SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
-        for (range_from, range_end) in ranges {
-            let mut page = range_from & !(crate::watch::PAGE - 1);
-            while page < range_end {
-                let from = page.max(range_from);
-                let to = (page + crate::watch::PAGE).min(range_end);
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                let reading = std::time::Instant::now();
-                let read = crate::host::read_into(from as *const u8, &mut page_bytes);
-                SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
-                if read {
-                    pages += 1;
-                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    // The page's records in one go, under one lock
-                    // (`HostHeap::mirror_copied_page`); one by one below
-                    // with `VICTORY_HEAP_SYNC_PAGE=0`.
-                    let slots = if page_at_once() {
-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
-                        looked += seen;
-                        mirrored += made;
-                        0..0
-                    } else {
-                        slots
-                    };
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
-                    }
-                }
-                page += crate::watch::PAGE;
-            }
+        let merged = coalesce_ranges(ranges);
+        for (from, to) in chunk_ranges(&merged, chunk_bytes) {
+            total_bytes += to - from;
+            chunks.push(SyncChunk {
+                heap_ptr: at,
+                start,
+                step,
+                mirrored_count,
+                from,
+                to,
+            });
         }
     }
+    let totals = std::sync::Arc::new(SyncTotals::default());
+    let wide_started = std::time::Instant::now();
+    let worker_cap = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6) + 1;
+    let batches = if parallel && (chunks.len() >= 4 || (chunks.len() >= 2 && total_bytes >= chunk_bytes)) {
+        chunks.len().min(worker_cap)
+    } else {
+        1
+    };
+    if batches <= 1 {
+        process_sync_batch(&chunks, read_fn, use_page_at_once, &totals);
+    } else {
+        // Distribute largest chunks first across balanced batches so skewed ranges
+        // finish together without holding any shared slot/page lock.
+        chunks.sort_unstable_by_key(|a| std::cmp::Reverse(a.to - a.from));
+        let mut grouped: Vec<Vec<SyncChunk>> = (0..batches).map(|_| Vec::new()).collect();
+        let mut loads = vec![0usize; batches];
+        for chunk in chunks {
+            let best = loads
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, load)| *load)
+                .map_or(0, |(idx, _)| idx);
+            loads[best] += chunk.to - chunk.from;
+            grouped[best].push(chunk);
+        }
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = grouped
+            .into_iter()
+            .filter(|batch| !batch.is_empty())
+            .map(|batch| {
+                let totals = totals.clone();
+                Box::new(move || process_sync_batch(&batch, read_fn, use_page_at_once, &totals))
+                    as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+    }
+    let wide_wall_us = wide_started.elapsed().as_micros() as u64;
     drop(heaps);
+    let pages = totals.pages.load(Relaxed);
+    let looked = totals.looked.load(Relaxed);
+    let mirrored = totals.mirrored.load(Relaxed);
+    let raw_read = totals.read_us.load(Relaxed);
+    let raw_walk = totals.walk_us.load(Relaxed);
+    let raw_make = totals.make_us.load(Relaxed);
+    let raw_sum = raw_read + raw_walk + raw_make;
+    if raw_sum > 0 && batches > 1 {
+        // Scale worker sums into `wide_run` wall microseconds so part timings stay comparable.
+        SYNC_PARTS[1].fetch_add(raw_read.saturating_mul(wide_wall_us) / raw_sum, Relaxed);
+        SYNC_PARTS[2].fetch_add(raw_walk.saturating_mul(wide_wall_us) / raw_sum, Relaxed);
+        SYNC_PARTS[3].fetch_add(raw_make.saturating_mul(wide_wall_us) / raw_sum, Relaxed);
+    } else {
+        SYNC_PARTS[1].fetch_add(raw_read, Relaxed);
+        SYNC_PARTS[2].fetch_add(raw_walk, Relaxed);
+        SYNC_PARTS[3].fetch_add(raw_make, Relaxed);
+    }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
@@ -1725,5 +1935,332 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    /// Serializes tests that mutate/measure global `SHADER_HEAPS` & `SYNCED` state.
+    #[cfg(windows)]
+    fn sync_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(windows)]
+    static TEST_READ_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(windows)]
+    fn counting_read_into(src: *const u8, dst: &mut [u8]) -> bool {
+        TEST_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::host::read_into(src, dst)
+    }
+
+    #[cfg(windows)]
+    fn alloc_write_watch(bytes: usize) -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let alloc_bytes = bytes.max(1).next_multiple_of(crate::watch::PAGE);
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                alloc_bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!ptr.is_null());
+        ptr.cast()
+    }
+
+    #[cfg(windows)]
+    fn free_write_watch(ptr: *mut u8) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: allocation created with `VirtualAlloc`.
+        unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[cfg(windows)]
+    fn reset_sync_counters() {
+        for a in &SYNCED {
+            a.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        for a in &SYNC_PARTS {
+            a.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        TEST_READ_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(windows)]
+    fn populate_mixed_records(memory: *mut u8, count: usize, start_gen: u32) {
+        let mut cbv_slot = [0u64; 4];
+        let mut view_slot = [0u64; 4];
+        if start_gen.is_multiple_of(2) {
+            create_srv(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                view_slot.as_mut_ptr() as u64,
+            );
+        } else {
+            create_uav(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                view_slot.as_mut_ptr() as u64,
+            );
+        }
+        for i in 0..count {
+            // SAFETY: scratch heap backing has `count * 32` bytes.
+            unsafe {
+                let dst = memory.add(i * 32);
+                if i % 4 == 0 {
+                    std::ptr::copy_nonoverlapping(view_slot.as_ptr().cast::<u8>(), dst, 32);
+                } else {
+                    let addr = 0x6_0000_0000u64 + ((i as u64 + u64::from(start_gen)) * 0x100);
+                    create_cbv(
+                        std::ptr::null(),
+                        &[addr as u32, (addr >> 32) as u32, 256, 0],
+                        cbv_slot.as_mut_ptr() as u64,
+                    );
+                    std::ptr::copy_nonoverlapping(cbv_slot.as_ptr().cast::<u8>(), dst, 32);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn coalesced_parallel_sync_matches_single_page_parity() {
+        let _guard = sync_test_guard();
+        let count = 32_768u32; // 1 MiB = 16 × 64 KiB watched blocks
+        let bytes = count as usize * 32;
+        let run = |chunk_bytes: usize, page_mode: bool, parallel: bool| -> Option<(Vec<bool>, [u64; 4])> {
+            let mem = alloc_write_watch(bytes);
+            let desc = HeapDesc {
+                kind: VIEWS_KIND,
+                count,
+                flags: SHADER_VISIBLE,
+                nodes: 1,
+            };
+            let placement = Placement {
+                address: mem as u64,
+                size: bytes as u64,
+            };
+            let mut h: This = std::ptr::null();
+            assert_eq!(create(desc, placement, &mut h), S_OK);
+            let Some(host) = heap(h).host() else {
+                slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+                free_write_watch(mem);
+                return None;
+            };
+            populate_mixed_records(mem, count as usize, 1);
+            reset_sync_counters();
+            sync_heaps_with(counting_read_into, chunk_bytes, page_mode, parallel);
+            let reads = TEST_READ_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let stats = [
+                SYNCED[0].load(std::sync::atomic::Ordering::Relaxed),
+                SYNCED[1].load(std::sync::atomic::Ordering::Relaxed),
+                SYNCED[2].load(std::sync::atomic::Ordering::Relaxed),
+                reads,
+            ];
+            let made: Vec<bool> = (0..count).map(|i| host.made(i)).collect();
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            free_write_watch(mem);
+            Some((made, stats))
+        };
+
+        let Some((single_made, single_stats)) = run(crate::watch::PAGE, false, false) else {
+            return; // no host GPU
+        };
+        let (coal_made, coal_stats) = run(SYNC_CHUNK_BYTES, true, true).expect("same host GPU");
+        assert_eq!(single_made, coal_made, "bit-for-bit slot parity");
+        assert_eq!(single_stats[0], coal_stats[0], "pages spanned parity");
+        assert_eq!(single_stats[1], coal_stats[1], "slots looked parity");
+        assert_eq!(single_stats[2], coal_stats[2], "slots mirrored parity");
+        assert!(
+            coal_stats[3] * 2 <= single_stats[3],
+            "expected >=2x read_into reduction: single={} coal={}",
+            single_stats[3],
+            coal_stats[3]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn coalesced_sync_falls_back_to_pages_around_unmapped_gap() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let _guard = sync_test_guard();
+        let page = crate::watch::PAGE;
+        let total_pages = 2usize; // 128 KiB = 1 SYNC_CHUNK_BYTES chunk
+        let bytes = total_pages * page;
+        let count = (bytes / 32) as u32;
+        let mem = alloc_write_watch(bytes);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: mem as u64,
+            size: bytes as u64,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let Some(host) = heap(h).host() else {
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            free_write_watch(mem);
+            return;
+        };
+        // Write valid slots in watched block 0.
+        let mut srv = [0u64; 4];
+        create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), srv.as_mut_ptr() as u64);
+        let slots_per_page = (page / 32) as u32;
+        // SAFETY: slot falls inside committed block 0.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                srv.as_ptr().cast::<u8>(),
+                mem.add(32),
+                32,
+            );
+        }
+        // Dirty the first 4 KiB OS page of block 1, then decommit its second 4 KiB OS page
+        // so write-watch reports one contiguous 128 KiB range whose chunk read fails.
+        // SAFETY: block 1 is committed before this write/decommit.
+        unsafe { mem.add(page).write(1) };
+        let decommitted = unsafe { VirtualFree(mem.add(page + 4096).cast(), 4096, MEM_DECOMMIT) };
+        assert_ne!(decommitted, 0);
+
+        reset_sync_counters();
+        sync_heaps_with(counting_read_into, SYNC_CHUNK_BYTES, true, false);
+        // 1 failed 128 KiB chunk read + 2 fallback per-block reads = 3 total.
+        assert_eq!(TEST_READ_COUNT.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert!(host.made(1), "block 0 slot mirrored around partial-unmapped block 1");
+        assert!(!host.made(slots_per_page + 1), "unmapped block 1 must stay unmade");
+
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        free_write_watch(mem);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unchanged_slots_are_skipped_and_chunk_boundaries_do_not_drop_or_duplicate_records() {
+        let _guard = sync_test_guard();
+        let page = crate::watch::PAGE;
+        // Verify touching range coalescing stops at non-adjacent gaps and chunk_ranges splits cleanly.
+        assert_eq!(
+            coalesce_ranges(vec![(2 * page, 3 * page), (page, 2 * page), (5 * page, 6 * page)]),
+            vec![(page, 3 * page), (5 * page, 6 * page)]
+        );
+        assert_eq!(
+            chunk_ranges(&[(page, page + SYNC_CHUNK_BYTES + page)], SYNC_CHUNK_BYTES),
+            vec![(page, page + SYNC_CHUNK_BYTES), (page + SYNC_CHUNK_BYTES, page + SYNC_CHUNK_BYTES + page)]
+        );
+
+        let count = (SYNC_CHUNK_BYTES / 32) as u32 + 32;
+        let bytes = count as usize * 32;
+        let mem = alloc_write_watch(bytes);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: mem as u64,
+            size: bytes as u64,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let Some(host) = heap(h).host() else {
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            free_write_watch(mem);
+            return;
+        };
+        let boundary_left = (SYNC_CHUNK_BYTES / 32) as u32 - 1;
+        let boundary_right = (SYNC_CHUNK_BYTES / 32) as u32;
+        let mut srv = [0u64; 4];
+        create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), srv.as_mut_ptr() as u64);
+        for s in [boundary_left, boundary_right] {
+            // SAFETY: inside `bytes`.
+            unsafe { std::ptr::copy_nonoverlapping(srv.as_ptr().cast::<u8>(), mem.add(s as usize * 32), 32) };
+        }
+        reset_sync_counters();
+        sync_heaps_with(counting_read_into, SYNC_CHUNK_BYTES, true, true);
+        assert!(host.made(boundary_left));
+        assert!(host.made(boundary_right));
+        assert_eq!(SYNCED[2].load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        // Re-write the exact same record bytes to dirty the write-watch page without changing content.
+        for s in [boundary_left, boundary_right] {
+            // SAFETY: inside `bytes`.
+            unsafe { std::ptr::copy_nonoverlapping(srv.as_ptr().cast::<u8>(), mem.add(s as usize * 32), 32) };
+        }
+        reset_sync_counters();
+        sync_heaps_with(counting_read_into, SYNC_CHUNK_BYTES, true, true);
+        assert!(SYNCED[1].load(std::sync::atomic::Ordering::Relaxed) >= 2);
+        assert_eq!(SYNCED[2].load(std::sync::atomic::Ordering::Relaxed), 0, "unchanged slots must be skipped");
+
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        free_write_watch(mem);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_coalesced_parallel_benchmark() {
+        let _guard = sync_test_guard();
+        let count = 14_400u32;
+        let bytes = count as usize * 32;
+        let mem = alloc_write_watch(bytes);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: mem as u64,
+            size: bytes as u64,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if heap(h).host().is_none() {
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            free_write_watch(mem);
+            return;
+        }
+        let iters = 10u32;
+        let run_bench = |chunk_bytes: usize, parallel: bool, seed_base: u32| -> (f64, u64, [f64; 4]) {
+            let mut elapsed = std::time::Duration::ZERO;
+            let mut reads = 0u64;
+            let mut parts = [0u64; 4];
+            for iter in 0..iters {
+                populate_mixed_records(mem, count as usize, iter + seed_base);
+                reset_sync_counters();
+                let t0 = std::time::Instant::now();
+                sync_heaps_with(counting_read_into, chunk_bytes, true, parallel);
+                elapsed += t0.elapsed();
+                reads += TEST_READ_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+                for (dst, src) in parts.iter_mut().zip(&SYNC_PARTS) {
+                    *dst += src.load(std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let ms = elapsed.as_secs_f64() * 1000.0 / f64::from(iters);
+            let p_ms = parts.map(|u| u as f64 / 1000.0 / f64::from(iters));
+            (ms, reads / u64::from(iters), p_ms)
+        };
+        let (base_ms, base_reads, base_parts) = run_bench(crate::watch::PAGE, false, 1);
+        let (opt_ms, opt_reads, opt_parts) = run_bench(SYNC_CHUNK_BYTES, true, 1000);
+        eprintln!(
+            "sync_heaps bench ({count} dirty slots x {iters} iters):\n  \
+             baseline(64K serial):   {base_ms:.3} ms/iter ({base_reads} reads/iter) parts=[take={:.3}, read={:.3}, walk={:.3}, make={:.3}]\n  \
+             coalesced+parallel(128K): {opt_ms:.3} ms/iter ({opt_reads} reads/iter) parts=[take={:.3}, read={:.3}, walk={:.3}, make={:.3}]",
+            base_parts[0], base_parts[1], base_parts[2], base_parts[3],
+            opt_parts[0], opt_parts[1], opt_parts[2], opt_parts[3],
+        );
+        assert!(opt_reads * 2 <= base_reads, "coalescing failed: base={base_reads} opt={opt_reads}");
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        free_write_watch(mem);
     }
 }
