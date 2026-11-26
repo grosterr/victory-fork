@@ -551,6 +551,82 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
 
+/// One console wave of 64 threads, thread t holding t + 1. A branch on s0 (the wave's) picks
+/// `WaveActiveMax` (s0 not 0) or `WaveActiveMin`, and the two reductions share their end:
+/// each arm saves EXEC and reduces up to the read of lane 32, the join reads lane 0 and
+/// restores EXEC (`deferred_tiled:CS_WaterTransmittanceOpticalDepthProcessing`, 0xb3c-0xbe0).
+/// Neither block holds a whole section; `v_permlanex16_b32` lowered on its own reads the lanes
+/// the host has, so the translation is the one with the join's code in each arm
+/// ([`ir::whole_sections`]), where each section is whole.
+#[test]
+fn two_reductions_that_share_their_end_translate_as_two_sections() {
+    // an arm: save EXEC, the identity `init`, then `op` over the wave up to lane 32's read
+    let arm = |init: u32, op: u32| {
+        let mut w = vec![
+            0xBE8C_25C1, // s_or_saveexec_b64 s[12:13], -1
+            0x7E04_02FF,
+            init,        // v_mov_b32 v2, init
+            0xD501_0002,
+            0x0032_0902, // v_cndmask_b32 v2, v2, v4, s[12:13]
+        ];
+        for dpp in [0xDE54_C102, 0x9360_1202, 0x0009_2402] {
+            w.extend([op << 25 | 0x0004_04E9, dpp]); // v_<op>_f32 v2, v2, v2 dpp8:[...]
+        }
+        w.extend([
+            op << 25 | 0x0004_04FA,
+            0xFF09_4002, // v_<op>_f32 v2, v2, v2 row_mirror bound_ctrl:1
+            0xD778_0003,
+            0x0201_0102,               // v_permlanex16_b32 v3, v2, 0, 0
+            op << 25 | 0x0004_0503,    // v_<op>_f32 v2, v3, v2
+            0xD760_000E,
+            0x0001_4102,               // v_readlane_b32 s14, v2, 32
+            op << 25 | 0x0004_040E,    // v_<op>_f32 v2, s14, v2
+        ]);
+        w
+    };
+    let mut words = vec![
+        0x7E08_0D00, // v_cvt_f32_u32 v4, v0
+        0x0608_08F2, // v_add_f32 v4, 1.0, v4
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0014, // s_cbranch_scc1 to the minimum
+    ];
+    words.extend(arm(0xFF80_0000, 0x10)); // the maximum from -inf
+    words.push(0xBF82_0013); // s_branch to the join
+    words.extend(arm(0x7F80_0000, 0x0F)); // the minimum from +inf
+    words.extend([
+        0xD760_000E,
+        0x0001_0102, // v_readlane_b32 s14, v2, 0
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E00_020E, // v_mov_b32 v0, s14
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    // the section starts in the arms and ends in the join; afterwards each block holds whole ones
+    let sections = |p: &ir::Program| (0..p.blocks.len()).map(|b| super::wave::sections(p, b).len()).sum::<usize>();
+    assert_eq!(sections(&p), 0);
+    let q = ir::whole_sections(&p).expect("sections to join");
+    assert_eq!(sections(&q), 2);
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let st_q = structure::structure(&q).expect("structure");
+    let io_q = io::raise(&q, &native).expect("io::raise");
+    let res_q = resource::track(&q, &native.layout, native.stage, Some(&st_q)).expect("track");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let joined = super::emit_any(&c, &native, &q, &st_q, &io_q, &res_q);
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    let joined = joined.expect("the joined sections");
+    assert!(shader.dxil == joined.dxil, "the split sections' translation was taken");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (s0, expected) in [(1u32, 64.0f32), (0, 1.0)] {
         let Some(got) = on_the_card(&shader, [s0, 0]) else { return };
