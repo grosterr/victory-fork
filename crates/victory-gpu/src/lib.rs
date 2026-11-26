@@ -21,6 +21,8 @@ mod backreads;
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(windows)]
+mod card_mask;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
