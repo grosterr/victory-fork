@@ -8,15 +8,15 @@ Here I measure what each switch and pull request does on a 12 GB, 32-lane-wave c
 
 ## State (2026-11-26)
 
-**About 5.6 frames per second in the first rooms, 6.6 at best in the corridor.** Tested on one machine: RTX 3060 12 GB (driver 621.40), Ryzen 7 5700X, 32 GB RAM, Windows 11, Series X profile.
+**About 5.5 frames per second in the first rooms, 7.1 at best in the corridor.** Tested on one machine: RTX 3060 12 GB (driver 621.40), Ryzen 7 5700X, 32 GB RAM, Windows 11, Series X profile.
 
 | What | State on that machine |
 |------|-----------------------|
 | Boot, menus, loading | work |
 | Prologue | cutscene, cell block and corridor render lit and textured: people, hair, faces, posters, sunlight through windows |
 | Controls | keyboard and mouse (fxceless#577), gamepad |
-| Frame rate in the first rooms | **179 ms a frame (5.6 fps)** steady at ~5,500 draws; GPU ~78 ms, copy-back ~46 ms, preparing ~66 ms. Was 330 ms (3.0 fps) on 2026-11-25 |
-| Stability | no device loss in about 20 runs of up to 12 minutes each |
+| Frame rate in the first rooms | **175–185 ms a frame (5.4–5.7 fps)** steady at ~5,000 draws; GPU ~75 ms, copy-back ~47 ms, preparing ~70 ms. The first minutes (the cutscene, the way into the world) about 180 ms with `LOOKUP_CACHE=1`. Was 330 ms (3.0 fps) on 2026-11-25 |
+| Stability | no device loss in about 30 runs of up to 12 minutes each |
 | Shaders | 232 of 25,985 do not translate |
 
 Known problems:
@@ -25,13 +25,12 @@ Known problems:
 - A white frame for a moment between the opening cutscene and gameplay (~80 draws dropped for pipeline creation methods not implemented yet).
 - No ray-traced light: shaded places are flat; a few bright rectangles of light near bunk beds.
 - GPU time does not depend on resolution here (a 1080p display instead of the default 4K changed the frame by 2 %): it goes to per-draw work, the indirect argument clamps and barriers.
-- With 32 GB of RAM the system's commit reaches ~55 of 56.5 GB; a page file of 32 GB or more is advised.
+- The game takes 22–23 GB of the PC's memory. With 32 GB of RAM set a page file of 32 GB or more: with a ~13 GB one, a run where free memory fell to 0.3–0.5 GB had 223 ms a frame and worst frames over a second, against ~180 ms otherwise.
 
 ## What this branch is
 
-Branch `rtx3060` = the pull request stack fxceless#770 (`d034ac1`) with fxceless main `9c184b3` merged in, plus these pull requests not yet in main:
+Branch `rtx3060` = the pull request stack fxceless#770 (`d034ac1`) with fxceless main `46bf535` merged in (main carries fxceless#1014 now, opt-in: `VICTORY_CARD_HASH_WIDE=1`), plus these pull requests not yet in main:
 - fxceless#1057 (nullexxx): `console_insn.rs` and `console_insn_decode.rs`, ported from a GPL-2.0-only project, are gone; VIctory's own crash handler is used. On an AMD processor nothing is lost (the instructions they emulated run natively).
-- fxceless#1014 (martindevbr): the card compare hashes a piece with a group of 64 threads.
 - fxceless#1112 (KyleS98, fixes from DexNom and other forks): four shader translation fixes.
 - fxceless#1044 (Key-rs): DirectStorage workers sized to physical cores (8 here).
 - fxceless#1101 (KainanP): the driver watch counts only the Display source's events.
@@ -41,6 +40,7 @@ And our own commits:
 2. **A port of Marvisak/VIctory#2230** (`5494ad0`): a key tap between two reads of the current input state is not lost. Ported onto fxceless#577's keyboard and mouse controls, with a test of how the two work together. fxceless#640 does the same and may replace it.
 3. **Main's `INDIRECT_GATHER` merged with fxceless#864's clamp shader** in the stack: the gather path uses #864's `base + gi` index and records its dispatches in chunks of 64 with a UAV barrier between them ([fxceless#770](https://github.com/fxceless/victory-fork/pull/770#issuecomment-7173855026)).
 4. **One test expectation updated** (`6a53386`): fxceless#854 and #1112 both fix the same voxel visibility shader; with #1112 a lane mask that comes back as two scalar copies is again the compare's mask, which a #854 test had recorded as a limit.
+5. **fxceless main `46bf535` merged into the stack** (`af0b1a6`, 13 files with conflicts, both sides kept; notes in [fxceless#770](https://github.com/fxceless/victory-fork/pull/770#issuecomment-7177091407)). Two of main's watch tests assume no view set (fxceless#812 parks blocks found uncommitted in a placeholder until the runtime tells of a mapping); their expectations follow `view_set()`, and they pass unchanged with `VICTORY_VIEW_SET=0`.
 
 ## How it is run here
 
@@ -64,6 +64,8 @@ set VICTORY_COPY_PLAIN=1
 set VICTORY_JOIN_PARTS=1
 set VICTORY_BACK_OWN_VIEW=1
 set VICTORY_INDIRECT_GATHER=1
+set VICTORY_CARD_HASH_WIDE=1
+set VICTORY_LOOKUP_CACHE=1
 target\release\victory.exe run <game_scarlett_master.exe> --execute
 ```
 
@@ -78,8 +80,10 @@ Medians of steady frames, same save, first rooms; details of every run are kept 
 | `QUEUE2=1` | copy-back ~216 → ~65 ms |
 | `ASYNC_SUBMIT=1 QUEUE2=1 INDIRECT_WINDOW=1 COPY_PLAIN=1` together | 330 → 243–282 ms (3.0 → 3.5–4.1 fps). No room without walls here (reported in [fxceless#995](https://github.com/fxceless/victory-fork/pull/995#issuecomment-7171479022)); `VICTORY_INDIRECT_WINDOW_CHECK=1` compared 810,000 windows with no difference |
 | fxceless main `d510ee4` + `JOIN_PARTS=1 BACK_OWN_VIEW=1 INDIRECT_GATHER=1` | 198–230 ms |
-| fxceless#1014 (on by default; `VICTORY_CARD_HASH_WIDE=0` turns it off) | our passes on the card 37.4 → 7.0 ms; frame 221 → 174 ms ([fxceless#1014](https://github.com/fxceless/victory-fork/pull/1014#issuecomment-7172402732)) |
+| fxceless#1014 (`VICTORY_CARD_HASH_WIDE=1`; opt-in since main `6d20eed`) | our passes on the card 37.4 → 7.0 ms; frame 221 → 174 ms ([fxceless#1014](https://github.com/fxceless/victory-fork/pull/1014#issuecomment-7172402732)) |
 | fxceless main `9c184b3` + #1057, #1112, #1044, #1101 | 179 ms at more draws than before (5,564 against 4,944): the same as without them, within noise; nothing broke |
+| fxceless main `46bf535` (with `CARD_HASH_WIDE=1`) | 183 ms against 178 ms on `9c184b3` in the same session: within noise. `TARGET_VARIANTS` (on by default) made no pipeline in these runs |
+| `LOOKUP_CACHE=1` (fxceless#1237) | 92 % of ~180,000 asks a frame answered from the thread's memory; the steady frame the same (177–185 ms: the first rooms are not held by the preparing threads, which run at about half of one processor), the first three minutes 232 → 181 ms with the worst frames about 3.5 times shorter (one run) |
 | loose-LDS fallback of fxceless#799 (on) | posterized picture (bands on walls and skin) and +45 % GPU time; reported in [fxceless#799](https://github.com/fxceless/victory-fork/pull/799#issuecomment-7162619618) |
 | `INDIRECT_KEEP=1` (fxceless#780) | device hung after 2 minutes (that pull request is closed) |
 | `CARD_FETCH_INFLIGHT=1` + `CARD_REHASH_RUNS=1` + `JOIN_COPIES=1` | copy-back 187 → 44 ms, but GPU 134 → 422 ms: the frame doubled. Leave off on a card this size |
@@ -88,7 +92,7 @@ Medians of steady frames, same save, first rooms; details of every run are kept 
 
 - [VIctory](https://github.com/Marvisak/VIctory) by Marvisak and its contributors: the base of everything.
 - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (hyphennn) and its contributors.
-- The pull requests merged here on top: nullexxx (#1057), martindevbr (#1014), KyleS98 and DexNom (#1112), Key-rs (#1044), KainanP (#1101).
+- The pull requests merged here on top: nullexxx (#1057), KyleS98 and DexNom (#1112), Key-rs (#1044), KainanP (#1101); and martindevbr (#1014) and KyleS98 (#1237), now in main.
 - The pull request stack fxceless#770 by ExoCalibra, and the authors of the pull requests it carries: PiloteCode (#854), xiaotu030202 (#864), Chipsraine (#868), turbinedogbla-creator (#860), UwUCammie (#857), AscilCH (#764, #765), laptopnotebook (#644), KyleS98 (#715, #768, #798), pug205gti6 (#510), LeonardoS11 (#795), Peppacodes (#812), claude-GTA6 (#577), Lilith133T (#845).
 - Measuring, debugging and the changes here were done with [Claude Code](https://claude.com/claude-code); fix commits list their co-authors.
 
