@@ -783,7 +783,42 @@ pub(crate) struct RtvRecord {
 const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
+/// Value snapshot for replaying a command list after a cut. Keep the
+/// resource identity as an integer (like draw::State), never the address
+/// of mutable descriptor storage. The caller still owns the resource
+/// lifetime, as with the original recorded command.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct RtvSnapshot {
+    tag: u32,
+    described: u32,
+    resource: usize,
+    desc: [u32; 6],
+}
+
+#[cfg(windows)]
+impl RtvSnapshot {
+    pub(crate) fn restore(self) -> RtvRecord {
+        RtvRecord {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as This,
+            desc: self.desc,
+        }
+    }
+}
+
 impl RtvRecord {
+    #[cfg(windows)]
+    pub(crate) fn snapshot(self) -> RtvSnapshot {
+        RtvSnapshot {
+            tag: self.tag,
+            described: self.described,
+            resource: self.resource as usize,
+            desc: self.desc,
+        }
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -1673,6 +1708,27 @@ mod cbv_bench;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn render_target_snapshot_preserves_original_descriptor_words() {
+        let mut record = super::RtvRecord {
+            tag: super::RTV_TAG,
+            described: 1,
+            resource: 0x1000usize as crate::object::This,
+            desc: [24, 4, 0, 0, 0, 0],
+        };
+        let snapshot = record.snapshot();
+        record.desc[0] = 26;
+        record.resource = 0x2000usize as crate::object::This;
+        let restored = snapshot.restore();
+        assert_eq!(restored.tag, record.tag);
+        assert_eq!(restored.described, record.described);
+        assert_eq!(restored.desc[0], 24);
+        assert_eq!(restored.resource as usize, 0x1000);
+        assert_eq!(record.desc[0], 26);
+        assert_eq!(record.resource as usize, 0x2000);
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 

@@ -515,11 +515,11 @@ pub(crate) struct State {
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
     /// the host list that continues this one after a cut ([`State::replay`]):
-    /// whether a topology was set, the render target and depth handles, the
-    /// viewports, the scissors, the blend factor and the stencil reference.
+    /// whether a topology was set, snapshots of render target and depth
+    /// views, the viewports, scissors, blend factor and stencil reference.
     topology_set: bool,
-    target_handles: Vec<u64>,
-    depth_handle: u64,
+    target_views: Vec<Option<crate::descriptor::RtvSnapshot>>,
+    depth_view: Option<crate::descriptor::RtvSnapshot>,
     targets_set: bool,
     /// The formats of the views [`State::set_targets`] bound on the host
     /// list: a draw's pipeline is one for them
@@ -1296,25 +1296,34 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        self.target_handles.clear();
-        self.target_handles.extend_from_slice(handles);
-        self.depth_handle = depth;
-        self.targets_set = true;
-        self.targets.clear();
-        // The formats of the host views, for the draws' pipelines.
-        let mut formats = [0; 9];
-        let mut rtvs = Vec::new();
-        for &h in handles {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
+        self.target_views.clear();
+        self.target_views.extend(handles.iter().map(|&h| {
+            let record = crate::descriptor::rtv_record(h);
+            if record.is_none() {
                 once!(
                     handle = format_args!("{h:#x}"),
                     "render target without a recorded view"
                 );
-                continue;
-            };
+            }
+            record.map(|r| r.snapshot())
+        }));
+        self.depth_view = crate::descriptor::dsv_record(depth).map(|r| r.snapshot());
+        self.targets_set = true;
+        self.record_targets(list);
+    }
+
+    /// Recreate host views from the values captured at SetRenderTargets,
+    /// not from descriptor slots that the caller may since have rewritten.
+    fn record_targets(&mut self, list: &HostList) {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        self.targets.clear();
+        // Preserve the formats of the recreated views for pipeline variants.
+        let mut formats = [0; 9];
+        let mut rtvs = Vec::new();
+        for snapshot in self.target_views.iter().flatten() {
+            let record = snapshot.restore();
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 // A typed null view (or a target without a host copy) still
                 // takes its slot: left out, the next live target would move
@@ -1344,7 +1353,8 @@ impl State {
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+        let dsv = self.depth_view.and_then(|snapshot| {
+            let record = snapshot.restore();
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             let desc = record.depth_desc();
@@ -1420,9 +1430,7 @@ impl State {
     /// draw anyway. The dynamic descriptor slots and the tables made in
     /// them stay: the parts before the cut have not run yet, and they are
     /// given back when the title's list is reset.
-    /// shortcut: the render target views are made again from the handles'
-    /// descriptors as they are now, not as they were when the title set
-    /// the targets (a descriptor rewritten in between names another view).
+    /// Render target views retain the descriptor values originally recorded.
     pub(crate) fn replay(&mut self, list: &HostList) {
         // AscilCH #742: only scratch-backed tables expire at a cut.
         self.fresh_tables.retain(|_, (_, epoch)| epoch.is_none());
@@ -1433,8 +1441,7 @@ impl State {
             self.set_topology(list, self.topology);
         }
         if self.targets_set {
-            let handles = std::mem::take(&mut self.target_handles);
-            self.set_targets(list, &handles, self.depth_handle);
+            self.record_targets(list);
         }
         if !self.viewports.is_empty() {
             crate::draw::viewports(list, &self.viewports);
