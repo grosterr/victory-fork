@@ -649,8 +649,7 @@ pub(crate) struct GatherSet {
     pub(crate) scratch: ID3D12Resource,
     table_gpu: u64,
     table: usize,
-    /// A record's offset in the buffer, and its slot.
-    slots: std::collections::HashMap<u32, u32>,
+    records: u32,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the table is the list's own
@@ -659,27 +658,25 @@ unsafe impl Send for GatherSet {}
 
 impl GatherSet {
     pub(crate) fn new(src: ID3D12Resource, src_id: u64, (kind, stride): (u32, u32), scratch: ID3D12Resource, (table_gpu, table): (u64, *mut u8)) -> Self {
-        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, slots: Default::default() }
+        Self { src, src_id, kind, stride, scratch, table_gpu, table: table as usize, records: 0 }
     }
 
     /// The records gathered so far.
     pub(crate) fn records(&self) -> u32 {
-        self.slots.len() as u32
+        self.records
     }
 
-    /// The slot of the record at `offset`: the one it has, or the next
-    /// free one. None when the set is full.
+    /// Reserve a slot for this execution. Every execution is charged by
+    /// the clamp, even when several draws read the same argument offset.
+    /// Return None when the set is full.
     pub(crate) fn slot(&mut self, offset: u32) -> Option<u32> {
-        if let Some(&slot) = self.slots.get(&offset) {
-            return Some(slot);
-        }
-        let slot = self.slots.len() as u32;
+        let slot = self.records;
         if slot >= GATHER_MOST {
             return None;
         }
         // SAFETY: the table holds `GATHER_MOST` words.
         unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
-        self.slots.insert(offset, slot);
+        self.records += 1;
         Some(slot)
     }
 
@@ -1885,6 +1882,33 @@ void main() {
         );
         // Inactive slot 3 was never copied from `src_args`.
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn repeated_indirect_offsets_take_separate_budget_slots() {
+        let Some(host) = host() else {
+            return; // no D3D12 adapter
+        };
+        let buffer = host.uav_buffer(256).expect("test buffer");
+        let mut offsets = vec![u32::MAX; GATHER_MOST as usize];
+        let mut set = GatherSet::new(
+            buffer.clone(),
+            1,
+            (0, 16),
+            buffer,
+            (0, offsets.as_mut_ptr().cast()),
+        );
+
+        assert_eq!(set.slot(16), Some(0));
+        assert_eq!(set.slot(16), Some(1));
+        assert_eq!(set.records(), 2);
+        assert_eq!(&offsets[..3], &[16, 16, u32::MAX]);
+
+        for slot in 2..GATHER_MOST {
+            assert_eq!(set.slot(16), Some(slot));
+        }
+        assert_eq!(set.slot(16), None);
+        assert_eq!(set.records(), GATHER_MOST);
     }
 
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
