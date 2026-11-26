@@ -4568,8 +4568,17 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
+        let whole = [(at, at + n)];
+        let uncovered = (!skip.is_empty()).then(|| outside(at, at + n, skip));
+        let ranges = uncovered.as_deref().unwrap_or(&whole);
+        if ranges.is_empty() {
+            return 0;
+        }
+        // A successful read fills the prefix; a failed read uses it only as scratch.
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
@@ -4579,9 +4588,9 @@ impl Shadow {
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
+        let as_read = (mapped && merge_race_on()).then(|| title.to_vec());
         let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
+        for &(a, b) in ranges {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
@@ -5576,7 +5585,7 @@ mod card_merge_tests {
         const LEN: usize = 64 << 10;
         let (title_byte, shader_byte) = (100usize, 200usize);
         let content: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
-        let land = |mark: u64| -> Vec<u8> {
+        let land = |mark: u64, whole_sent: bool, scratch: &mut Vec<u8>| -> (Vec<u8>, usize) {
             let mut title = content.clone();
             let mut side = content.clone();
             // The title's byte, refreshed into the CPU's side and sent up in send 7.
@@ -5587,7 +5596,7 @@ mod card_merge_tests {
                 staging: staging.clone(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
-                sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                sent: Mutex::new(if whole_sent { vec![(0, LEN, 7)] } else { vec![(title_byte, title_byte + 1, 7)] }),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
                 me: std::sync::OnceLock::new(),
@@ -5599,18 +5608,26 @@ mod card_merge_tests {
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();
             slot[shader_byte] ^= 0xc3;
-            let written = shadow.card_merge_relay(0, &slot, 6, &mut Vec::new());
-            assert!(written > 0);
+            let written = shadow.card_merge_relay(0, &slot, 6, scratch);
             drop(shadow);
-            title
+            (title, written)
         };
-        let fixed = land(crate::host::fallback_fetched_mark(true, 7, Some(5)));
+        let mut scratch = vec![0xff; 1024];
+        let (fixed, written) = land(crate::host::fallback_fetched_mark(true, 7, Some(5)), false, &mut scratch);
+        assert!(written > 0);
         assert_eq!(fixed[title_byte], content[title_byte] ^ 0x5a, "the title's byte was lost");
         assert_eq!(fixed[shader_byte], content[shader_byte] ^ 0xc3, "the shader's write did not land");
+        assert_eq!(scratch.len(), 1024);
         // The mark at the fetch's count: the note of send 7 is gone and the
         // older card byte is taken for a shader's write.
-        let before = land(7);
+        let (before, _) = land(7, false, &mut scratch);
         assert_eq!(before[title_byte], content[title_byte]);
+        let before_skip = scratch.clone();
+        let (skipped, written) = land(5, true, &mut scratch);
+        assert_eq!(written, 0);
+        assert_eq!(skipped[title_byte], content[title_byte] ^ 0x5a);
+        assert_eq!(skipped[shader_byte], content[shader_byte]);
+        assert_eq!(scratch, before_skip);
     }
 }
 
