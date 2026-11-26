@@ -101,15 +101,16 @@ pub(crate) static UNCOMPARED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) static SKIPPED: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
-/// Copies smaller than this always come back with [`skip_wc_back`]: small
-/// write-combining buffers hold counts and visibility lists the title's
-/// CPU reads (fxceless/victory-fork#1379: skipping them gave flashes and
-/// half the draws). `VICTORY_SKIP_WC_BACK_MIN_KB` (default 1024; 0 skips
-/// every size, as before).
-fn skip_back_min() -> u64 {
+/// Copies smaller than this are always compared and always come back with
+/// [`skip_wc_compare`] / [`skip_wc_back`]: small write-combining buffers
+/// hold counts and visibility lists the title's CPU reads
+/// (fxceless/victory-fork#1163, #1379: skipping them gave flashes, headless
+/// characters and a sixth of the draws gone). `VICTORY_SKIP_WC_MIN_KB`
+/// (default 1024, the name used in #1163; 0 skips every size, as before).
+pub(crate) fn skip_wc_min_bytes() -> u64 {
     static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
-        std::env::var("VICTORY_SKIP_WC_BACK_MIN_KB")
+        std::env::var("VICTORY_SKIP_WC_MIN_KB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(1024)
@@ -120,7 +121,7 @@ fn skip_back_min() -> u64 {
 /// With [`skip_wc_back`]: whether a piece of `bytes` of the copy (`len`
 /// bytes) of the title buffer at `start` is left on the card (counted).
 pub(crate) fn skip_back(start: u64, len: u64, bytes: u64) -> bool {
-    if !skip_wc_back() || len < skip_back_min() {
+    if !skip_wc_back() || len < skip_wc_min_bytes() {
         return false;
     }
     let wc = is_wc(start);

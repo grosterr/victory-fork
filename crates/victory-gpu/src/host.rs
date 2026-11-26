@@ -6362,7 +6362,13 @@ impl Host {
         // flights' own declared writes (`declared_writes`).
         if crate::census::skip_wc_compare() {
             let before = declared.len();
-            declared.retain(|(shadow, _)| !crate::census::is_wc(shadow.title_start()));
+            // Copies under `VICTORY_SKIP_WC_MIN_KB` are still compared: the
+            // small write-combining buffers hold what the title's CPU reads
+            // (fxceless/victory-fork#1163: unguarded, a sixth of the draws
+            // went and two frames in three were black).
+            declared.retain(|(shadow, _)| {
+                shadow.span().1 < crate::census::skip_wc_min_bytes() || !crate::census::is_wc(shadow.title_start())
+            });
             crate::census::UNCOMPARED.fetch_add((before - declared.len()) as u64, Ordering::Relaxed);
         }
         // With the relay: the order of the queue is held from here until
