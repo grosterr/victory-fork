@@ -953,12 +953,49 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 /// level so that the marked pass can have this one start anew:
 /// [`State::heap_buffers_marked`].)
 type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<u64, (u64, Ranges)>>> =
     std::sync::Mutex::new(None);
 /// Per host heap, for [`State::heap_buffers_marked`]: what the marked pass
 /// keeps (`VICTORY_HEAP_PASS_MARKED`; nothing while that is unset).
 type Marked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
-static MARKED: std::sync::Mutex<Option<std::collections::HashMap<usize, Marked>>> = std::sync::Mutex::new(None);
+static MARKED: std::sync::Mutex<Option<std::collections::HashMap<u64, Marked>>> = std::sync::Mutex::new(None);
+/// Called when the title heap is destroyed, after the shader-heap registry
+/// lock is released. Drop cached resource references outside both locks.
+pub(crate) fn forget_heap_ranges(id: u64) {
+    let marked = MARKED.lock().unwrap_or_else(|e| e.into_inner())
+        .as_mut().and_then(|heaps| heaps.remove(&id));
+    let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner())
+        .as_mut().and_then(|heaps| heaps.remove(&id));
+    drop(marked);
+    drop(ranges);
+}
+
+#[cfg(test)]
+#[test]
+fn heap_range_cache_forgets_both_passes() {
+    // IDs are allocated monotonically from 1. Reserve a synthetic high ID.
+    let id = u64::MAX - 1;
+    let other = u64::MAX - 2;
+    {
+        let mut ranges = RANGES.lock().unwrap();
+        let heaps = ranges.get_or_insert_with(Default::default);
+        heaps.insert(id, (17, Ranges::new()));
+        heaps.insert(other, (3, Ranges::new()));
+    }
+    {
+        let mut marked = MARKED.lock().unwrap();
+        let heaps = marked.get_or_insert_with(Default::default);
+        heaps.insert(id, Marked::new(false));
+        heaps.insert(other, Marked::new(false));
+    }
+    forget_heap_ranges(id);
+    assert!(!RANGES.lock().unwrap().as_ref().unwrap().contains_key(&id));
+    assert!(!MARKED.lock().unwrap().as_ref().unwrap().contains_key(&id));
+    assert!(RANGES.lock().unwrap().as_ref().unwrap().contains_key(&other));
+    assert!(MARKED.lock().unwrap().as_ref().unwrap().contains_key(&other));
+    forget_heap_ranges(other);
+}
+
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Where the pass over textures picked by index records its uploads: into
 /// a list of the title's, or into lists of the thread that runs it ahead.
@@ -2166,7 +2203,7 @@ impl State {
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
+            .entry(host.id())
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
         let slots = if *passes % 16 == 0 {
@@ -2314,7 +2351,7 @@ impl State {
         for picked in heaps.values_mut() {
             picked.note_forgotten(forgotten.as_deref());
         }
-        let ranges = heaps.entry(std::ptr::from_ref(host) as usize).or_insert_with(|| Marked::new(false));
+        let ranges = heaps.entry(host.id()).or_insert_with(|| Marked::new(false));
         let changed = host.buffer_changes();
         let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
         let slots = ranges.plan(changed, || host.buffer_slots(), record, crate::descriptor::record_entry);

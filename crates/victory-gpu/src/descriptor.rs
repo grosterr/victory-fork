@@ -755,6 +755,7 @@ impl Drop for Heap {
         // #589, AscilCH).
         if let Some(Some(host)) = self.host.get() {
             crate::memory::forget_heap(host);
+            crate::draw::forget_heap_ranges(host.id());
         }
     }
 }
