@@ -626,16 +626,17 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
-/// or touch as one, in order: every piece of `runs` is in the result once
-/// and no other piece is. Ranges sent up lie close together (514 a frame
-/// for 87 MB in run 102), and each had a pass of its own over its pieces,
-/// so a piece that held several ranges was hashed once for each.
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+/// (or touch, with `touching`) as one, in order: every piece of `runs` is
+/// in the result once and no other piece is. Ranges sent up lie close
+/// together (514 a frame for 87 MB in run 102), and each had a pass of its
+/// own over its pieces, so a piece that held several ranges was hashed once
+/// for each.
+pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>, touching: bool) -> Vec<CardSpan> {
     runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
+            Some(last) if run.first < last.first + last.pieces + u32::from(touching) => {
                 last.pieces = last.pieces.max(run.first + run.pieces - last.first);
                 last.to = last.to.max(run.to);
             }
@@ -700,12 +701,22 @@ mod card_tests {
         let mut wanted: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
         wanted.sort_unstable();
         wanted.dedup();
-        let joined = joined_piece_runs(runs);
-        let got: Vec<u32> = joined.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
-        assert_eq!(got, wanted);
-        assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
-        assert!(joined.iter().all(|r| r.skew == 7));
-        assert!(joined_piece_runs(Vec::new()).is_empty());
+        let ways: [(bool, &[(u32, u32)]); 2] = [
+            (true, &[(3, 5), (9, 1), (40, 3), (100, 1)]),
+            (false, &[(3, 2), (5, 3), (9, 1), (40, 1), (41, 2), (100, 1)]),
+        ];
+        for (touching, want) in ways {
+            let joined = joined_piece_runs(runs.clone(), touching);
+            let got: Vec<u32> = joined
+                .iter()
+                .flat_map(|r| r.first..r.first + r.pieces)
+                .collect();
+            assert_eq!(got, wanted);
+            let pieces: Vec<_> = joined.iter().map(|r| (r.first, r.pieces)).collect();
+            assert_eq!(pieces, want);
+            assert!(joined.iter().all(|r| r.skew == 7));
+            assert!(joined_piece_runs(Vec::new(), touching).is_empty());
+        }
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
@@ -4335,6 +4346,21 @@ impl Shadow {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(me.clone());
+        }
+    }
+
+    /// For tests and benchmarks: puts `title[a..b]` into the CPU side at
+    /// each run `(a, b)` (offsets in the copy) and notes the run for the
+    /// card, as the merge does with the runs it found changed.
+    #[cfg(test)]
+    pub(crate) fn card_put_runs(&self, title: &[u8], runs: &[(usize, usize)]) {
+        for &(a, b) in runs {
+            // SAFETY: inside the mapping of the copy's CPU side (the caller's
+            // runs lie inside the copy), which only this thread writes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr().add(a), self.data.add(a), b - a)
+            };
+            self.card_changed(a, b);
         }
     }
 
