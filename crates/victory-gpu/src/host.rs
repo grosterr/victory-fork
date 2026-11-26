@@ -11790,6 +11790,19 @@ impl Host {
                         overlay,
                         overlay_state,
                     );
+                    // The frame-rate panel goes over the blended frame too
+                    // (the path below draws it after its copy).
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    crate::fpsbox::draw(self, list, &back, (width, height, format));
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
                     copy.close();
                     match slot {
                         Some(i) => {
