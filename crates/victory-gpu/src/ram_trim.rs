@@ -139,6 +139,25 @@ pub(crate) fn aggressive() -> bool {
     })
 }
 
+/// `VICTORY_RAM_SAFE=0` (rtx3060 fork): turns the default-safe mode's two
+/// costly parts off for an A/B: large snapshots stay plain heap memory (no
+/// `VmBlock` commit / decommit on the copies' paths), and the low- and
+/// panic-memory policies (pools emptied, DXIL dropped at once while less
+/// than 4 / 2 GiB is free, which a 32 GiB host running the title sees all
+/// the time) are not taken. `VICTORY_RAM_TRIM=1` keeps its own behaviour.
+pub(crate) fn safe_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_RAM_SAFE").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!(
+                "default-safe RAM trimming's snapshot decommits and low-memory policies off (VICTORY_RAM_SAFE=0)"
+            );
+        }
+        on
+    })
+}
+
 /// Classifies a host by physical memory capacity, allowing slight firmware/BIOS
 /// carve-outs below nominal 16 GiB and 32 GiB boundaries.
 pub(crate) const fn tier_for_total_bytes(total_phys: u64) -> HostTier {
@@ -335,7 +354,13 @@ impl TrimPolicy {
     /// `DxilPin::drop`) to avoid repeating Win32 memory queries every frame.
     pub(crate) fn cached() -> Self {
         let s = host_status_cached();
-        Self::for_host(aggressive(), s.total_phys, s.avail_phys, s.avail_commit)
+        let aggressive = aggressive();
+        if !aggressive && !safe_on() {
+            // Unknown free memory (0) takes neither the low- nor the
+            // panic-memory policy.
+            return Self::for_host(false, s.total_phys, 0, 0);
+        }
+        Self::for_host(aggressive, s.total_phys, s.avail_phys, s.avail_commit)
     }
 }
 
@@ -864,6 +889,7 @@ pub(crate) enum SnapshotBuffer {
 impl SnapshotBuffer {
     pub(crate) fn new_zeroed(len: usize) -> Self {
         if len >= VM_THRESHOLD
+            && (aggressive() || safe_on())
             && let Some(block) = VmBlock::new_zeroed(len)
         {
             return Self::Large(block);

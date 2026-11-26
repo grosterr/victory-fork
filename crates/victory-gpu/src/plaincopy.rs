@@ -229,9 +229,37 @@ fn guarded_write(_: *mut u8, _: *const u8, _: usize) -> bool {
     false
 }
 
+/// `VICTORY_WRITE_PLAIN`: on by default with [`on`]; `0` off; `alt` twenty
+/// seconds off, twenty on, each change logged (an A/B within one run).
 fn write_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_WRITE_PLAIN").is_none_or(|v| v != "0"))
+    use std::sync::OnceLock;
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| {
+        if !on() {
+            return 0;
+        }
+        match std::env::var("VICTORY_WRITE_PLAIN").as_deref() {
+            Ok("0") => 0,
+            Ok("alt") => 2,
+            _ => 1,
+        }
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "copy-back writes made in place from now (VICTORY_WRITE_PLAIN=alt): {}",
+                    if on { "ON" } else { "off, through the kernel" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Writes made in place, their bytes, and the writes that met an unmapped or
