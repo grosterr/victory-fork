@@ -3,6 +3,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::Arc;
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -60,8 +62,9 @@ enum Held {
     Running,
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// the title's lists leave it in, the frame's number, and its pacing
+    /// slot (kept through any async GPU copy flight).
+    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64, Arc<FrameSlot<'static>>),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -110,7 +113,10 @@ fn present_behind() -> bool {
         };
         let mode = if asked != 0 && behind() && crate::host::late_free_present() { asked } else { 0 };
         if mode != 0 {
-            tracing::info!("presents go behind the queue's line and return at once (VICTORY_ASYNC_PRESENT=1; alt: in turn)");
+            tracing::info!(
+                frames_ahead = frames_ahead(),
+                "presents go behind the queue's line and return at once (VICTORY_ASYNC_PRESENT=1; alt: in turn)"
+            );
         }
         mode
     });
@@ -132,11 +138,72 @@ fn present_behind() -> bool {
     }
 }
 
+/// Whether asynchronous presents are currently active (for `fence.rs` null-event waits).
+#[cfg(windows)]
+pub(crate) fn async_present() -> bool {
+    present_behind()
+}
+
+/// Two queued or running presents by default (`VICTORY_FRAMES_AHEAD`, 1..=8).
+/// Adapted from Kelvaroq `0046-async-present-frame-waits.patch` (GPL-3.0).
+#[cfg(windows)]
+fn frames_ahead() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_FRAMES_AHEAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8)
+    })
+}
+
+/// A slot belongs to both the queued present and its GPU flight. The last
+/// owner returns it, including on errors. A change of presenting queue
+/// drains older frames so display order holds across queues as well.
+#[cfg(windows)]
+#[derive(Default)]
+struct FrameLimit {
+    active: std::sync::Mutex<(usize, usize)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(windows)]
+pub(crate) struct FrameSlot<'a>(&'a FrameLimit);
+
+#[cfg(windows)]
+impl FrameLimit {
+    fn enter(&self, queue: usize, limit: usize) -> FrameSlot<'_> {
+        let mut active = lock(&self.active);
+        let available = |&(owner, count): &(usize, usize)| count == 0 || (owner == queue && count < limit);
+        if !available(&active) {
+            active = self
+                .changed
+                .wait_while(active, |state| !available(state))
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        *active = (queue, active.1 + 1);
+        FrameSlot(self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FrameSlot<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.active).1 -= 1;
+        self.0.changed.notify_all();
+    }
+}
+
+#[cfg(windows)]
+static FRAME_SLOTS: std::sync::LazyLock<FrameLimit> = std::sync::LazyLock::new(FrameLimit::default);
+
 /// With [`present_behind`]: puts the present of the next frame behind what
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    let limit = frames_ahead();
+    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) >= limit as u64 {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -163,9 +230,11 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
+    let slot = Arc::new(FRAME_SLOTS.enter(this as usize, limit));
+    let mut slot = Some(slot);
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, frame, slot.take().expect("frame slot"))
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -460,7 +529,7 @@ pub(crate) fn release_held(all: bool) {
         wake();
         return;
     }
-    release_held_now(all);
+    let _ = release_held_now(all);
 }
 
 /// Whether a submission is only put in its queue's line by the thread
@@ -517,11 +586,26 @@ fn wake() {
 #[cfg(windows)]
 fn worker() {
     crate::framelog::keep_on_fast_cores("victory-submit");
+    let mut blocked = false;
     loop {
         {
             let mut work = lock(&WORK.0);
             while !*work {
-                work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+                if blocked && async_present() {
+                    // A title store to a mapped value has no wake call. At
+                    // the frame limit there may be no further submissions to
+                    // wake us either. Recheck the head without forcing it.
+                    let (next, timeout) = WORK
+                        .1
+                        .wait_timeout(work, std::time::Duration::from_millis(4))
+                        .unwrap_or_else(|e| e.into_inner());
+                    work = next;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                } else {
+                    work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+                }
             }
             *work = false;
         }
@@ -533,7 +617,7 @@ fn worker() {
                 crate::framelog::add(crate::framelog::T::WorkerSlow, 1);
             }
         }
-        release_held_now(false);
+        blocked = release_held_now(false);
         let (user_now, kernel_now) = crate::framelog::thread_times();
         crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
         crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
@@ -737,16 +821,16 @@ fn send_joined(joined: &mut Joined) {
 #[cfg(windows)]
 pub(crate) fn before_sync() {
     if behind() && !RELEASING_HERE.get() {
-        release_held_now(false);
+        let _ = release_held_now(false);
     }
 }
 
 #[cfg(windows)]
-fn release_held_now(all: bool) {
+fn release_held_now(all: bool) -> bool {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
-        return;
+        return false;
     }
     let _one = lock(&RELEASING);
     let was_here = RELEASING_HERE.replace(true);
@@ -764,6 +848,7 @@ fn release_held_now(all: bool) {
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
+        let mut blocked = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
             let line = unsafe { &(*(q as *const Queue)).held };
@@ -777,6 +862,7 @@ fn release_held_now(all: bool) {
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
+                        blocked = true;
                         break;
                     }
                     // With parts taken and not sent: only what is known
@@ -785,12 +871,16 @@ fn release_held_now(all: bool) {
                     Some(Held::Value(wait)) if !all && !joined.is_empty() => {
                         if !wait.met() && !crate::host::late_met_known(wait) {
                             if !joined.meets(wait) {
+                                blocked = true;
                                 break;
                             }
                             JOINED[4].fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Value(wait)) if !all && !value_met(wait) => {
+                        blocked = true;
+                        break;
+                    }
                     // The frame is shown behind the parts taken: they are
                     // sent first.
                     Some(Held::Present(..)) if !joined.is_empty() => break,
@@ -897,10 +987,11 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
-                        let show = || {
+                    Held::Present(texture, state, frame, slot) => {
+                        let mut slot = Some(slot);
+                        let mut show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present_with_slot(&texture, state, frame, slot.take());
                             }
                         };
                         if all {
@@ -937,7 +1028,7 @@ fn release_held_now(all: bool) {
         }
         if !moved {
             if joined.is_empty() {
-                break;
+                return blocked;
             }
             // Nothing more is free to run behind the parts taken: they go
             // to the host, and what stood at a wait is looked at again.
@@ -1336,15 +1427,15 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         // (With `behind`: what the queues hold runs here first, and what
         // it sent is settled with the rest.)
         if behind() {
-            release_held_now(false);
+            let _ = release_held_now(false);
         }
         crate::host::settle_for_present();
-        release_held_now(false);
+        let _ = release_held_now(false);
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
-        release_held_now(false);
+        let _ = release_held_now(false);
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
@@ -1352,6 +1443,11 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     if !sent_behind {
         release_held(forces());
     }
+    // When falling back to a synchronous present (capture, full queue, or
+    // queue switch), drain any older async frame slots after releasing the
+    // queue so earlier queued presents keep display order.
+    #[cfg(windows)]
+    let _older = (async_present() && !sent_behind).then(|| FRAME_SLOTS.enter(0, 1));
     #[cfg(windows)]
     crate::framelog::add(crate::framelog::T::PresentLineUs, presenting.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1699,5 +1795,34 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_frame_slot_stays_taken_until_its_gpu_owner_leaves() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        use std::time::Duration;
+        let limit = FrameLimit::default();
+        let first = Arc::new(limit.enter(1, 2));
+        let on_card = first.clone();
+        let second = limit.enter(1, 2);
+        drop(first);
+        std::thread::scope(|scope| {
+            let (trying, tried) = channel();
+            let (entered, entry) = channel();
+            let limit = &limit;
+            scope.spawn(move || {
+                trying.send(()).unwrap();
+                let _third = limit.enter(1, 2);
+                entered.send(()).unwrap();
+            });
+            tried.recv().unwrap();
+            assert_eq!(entry.recv_timeout(Duration::from_millis(20)), Err(RecvTimeoutError::Timeout));
+            drop(on_card);
+            entry.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        assert_eq!(*lock(&limit.active), (1, 1));
+        drop(second);
+        assert_eq!(*lock(&limit.active), (1, 0));
     }
 }

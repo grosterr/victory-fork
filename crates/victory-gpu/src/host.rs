@@ -4040,6 +4040,8 @@ struct Flight {
     card: Option<CardPlan>,
     back: Vec<Declared>,
     texture_back_ranges: Vec<(usize, usize)>,
+    /// A queued present's pacing slot kept until its async copy lands.
+    _frame: Option<std::sync::Arc<crate::queue::FrameSlot<'static>>>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -7586,6 +7588,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
+                _frame: None,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -7611,7 +7614,11 @@ impl Host {
     /// others. The caller keeps the list and does not reset it before the
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
-    fn execute_own(&self, list: &HostList) -> u64 {
+    fn execute_own(
+        &self,
+        list: &HostList,
+        frame: Option<std::sync::Arc<crate::queue::FrameSlot<'static>>>,
+    ) -> u64 {
         late_threads();
         let Some((submitted, sent)) = self.submit(&[list], true) else {
             return 0;
@@ -7637,6 +7644,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_back_ranges: sent.texture_back_ranges,
+                _frame: frame,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -11415,13 +11423,30 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_with_slot(texture, state, frame, None)
+    }
+
+    /// As [`Host::present`], keeping `frame_slot` alive across any async copy flight.
+    pub(crate) fn present_with_slot(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        frame_slot: Option<std::sync::Arc<crate::queue::FrameSlot<'static>>>,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, frame, frame_slot);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        frame_slot: Option<std::sync::Arc<crate::queue::FrameSlot<'static>>>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -11528,7 +11553,7 @@ impl Host {
             copy.close();
             match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let flown = self.execute_own(copy, frame_slot);
                     p.ahead[i].1 = flown;
                 }
                 None => self.execute(&[copy]),
@@ -12490,7 +12515,7 @@ void main() {
             }
             list.close();
             if late() {
-                host.execute_own(&list);
+                host.execute_own(&list, None);
             } else {
                 host.execute(&[&list]);
             }

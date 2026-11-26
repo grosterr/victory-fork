@@ -97,6 +97,41 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     #[cfg(all(windows, feature = "diagnostics"))]
     pace::waits(this, &fence.asked, value, fence.value.load(Ordering::Acquire));
     if event.is_null() {
+        #[cfg(windows)]
+        if crate::queue::async_present() {
+            // The signal may still be queued behind next frame's preparation.
+            // Wait on the same publication as a title-supplied event. Adapted
+            // from Kelvaroq `0046-async-present-frame-waits.patch` (GPL-3.0).
+            use windows_sys::Win32::Foundation::{
+                CloseHandle, E_FAIL, E_OUTOFMEMORY, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            };
+            use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+            // SAFETY: private auto-reset event, closed after deregistration.
+            let ready = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if ready.is_null() {
+                return E_OUTOFMEMORY;
+            }
+            waiters.push((value, ready as usize));
+            drop(waiters);
+            let result = loop {
+                // A bottom-of-pipe write can also update the mapped fence
+                // word directly, without going through set().
+                match unsafe { WaitForSingleObject(ready, 4) } {
+                    WAIT_OBJECT_0 => break S_OK,
+                    WAIT_TIMEOUT if fence.value.load(Ordering::Acquire) < value => continue,
+                    WAIT_TIMEOUT => break S_OK,
+                    _ => break E_FAIL,
+                }
+            };
+            fence
+                .waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|&(_, handle)| handle != ready as usize);
+            // SAFETY: `ready` was created above and removed from `waiters`.
+            unsafe { CloseHandle(ready) };
+            return result;
+        }
         // With submissions sent to the card and not waited for
         // (`crate::host::late`) the signal may be behind them: they are
         // settled, which sets it.
@@ -346,7 +381,9 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        if !crate::queue::async_present() {
+            assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        }
         // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
