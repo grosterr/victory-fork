@@ -88,9 +88,12 @@ pub(crate) fn start() {
         }
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let channel = wide("System");
-        // The kernel drivers of the three vendors, and the warnings and
-        // errors of the system's own "display driver stopped responding"
-        // source.
+        // The kernel drivers of the three vendors (every entry), and the
+        // system's own "display driver stopped responding" source (4101, a
+        // warning) from warning level up only: the `Display` source also writes
+        // information entries that are no fault, among them 4125, the Auto HDR
+        // notice, which Windows 11 writes when a game's window first shows
+        // (fork pull requests #1101 and #1255, issue #1077).
         let query = wide(&query(&DRIVERS, "Display"));
         // SAFETY: valid strings for the call's length; the callback is a
         // plain function that touches only statics; the subscription is
