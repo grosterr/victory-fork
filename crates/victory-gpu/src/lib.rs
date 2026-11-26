@@ -41,6 +41,8 @@ mod fpsbox;
 #[cfg(windows)]
 mod stats;
 #[cfg(windows)]
+mod submit_stages;
+#[cfg(windows)]
 mod spread;
 #[cfg(windows)]
 mod draw;

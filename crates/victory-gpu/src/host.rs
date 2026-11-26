@@ -5200,6 +5200,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     if done(&line) {
         return;
     }
+    let _wait = crate::submit_stages::enter(crate::submit_stages::Stage::Wait);
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
@@ -7672,6 +7673,7 @@ impl Host {
         if !late() {
             return;
         }
+        let _wait = crate::submit_stages::enter(crate::submit_stages::Stage::Wait);
         if relay() {
             // Nothing is settled here: the thread that lands flights does
             // it, in order, and this waits until nothing is in the air and
@@ -7822,6 +7824,7 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::submit_stages::count_submission();
         let was_working = working(true);
         submitting(1, runs.len());
         self.video_memory_look();
@@ -7846,6 +7849,7 @@ impl Host {
         // (`crate::descriptor::sync_beside`).
         let beside = crate::descriptor::sync_beside();
         if !beside {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Descriptors);
             crate::descriptor::sync_heaps();
         }
         let behind = late && flying();
@@ -7867,10 +7871,13 @@ impl Host {
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run (with the pass, beside, after it).
-        if beside {
-            crate::descriptor::sync_begin();
-        } else {
-            crate::descriptor::make_waiting();
+        {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Descriptors);
+            if beside {
+                crate::descriptor::sync_begin();
+            } else {
+                crate::descriptor::make_waiting();
+            }
         }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
@@ -7908,7 +7915,10 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
+            {
+                let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Watch);
+                crate::watch::ask_once(&ranges);
+            }
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -7917,6 +7927,7 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
+                let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Watch);
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
@@ -7925,27 +7936,38 @@ impl Host {
             settled += settling.elapsed();
         }
         part = prep_part(0, part);
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+        {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Record);
+            for list in runs {
+                list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
             }
-            lists.push(list.list.cast().ok());
         }
         part = prep_part(1, part);
-        batch.flush();
-        crate::watch::ask_once_end();
+        {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Copies);
+            batch.flush();
+        }
+        {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Watch);
+            crate::watch::ask_once_end();
+        }
         part = prep_part(2, part);
         // The pass over the view heap, if it ran beside: done before any
         // list of this submission goes to the card.
         if beside {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Descriptors);
             crate::descriptor::sync_end();
         }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Record);
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
@@ -7962,7 +7984,10 @@ impl Host {
             settled += settling.elapsed();
         }
         part = prep_part(3, part);
-        let card = self.card_before(runs, flown, *submitted);
+        let card = {
+            let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Hashes);
+            self.card_before(runs, flown, *submitted)
+        };
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -7971,9 +7996,12 @@ impl Host {
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+            let signalled = {
+                let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Execute);
+                unsafe {
+                    self.queue.ExecuteCommandLists(&lists);
+                    self.queue.Signal(&self.fence, *submitted)
+                }
             };
             self.card_sent();
             prep_part(5, prepared);
@@ -8019,16 +8047,21 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
-                self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let waited = {
+                    let _stage = crate::submit_stages::enter(crate::submit_stages::Stage::Execute);
+                    self.queue.ExecuteCommandLists(group);
+                    self.card_sent();
+                    self.queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event))
+                };
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        {
+                            let _wait = crate::submit_stages::enter(crate::submit_stages::Stage::Wait);
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
                         stood(started);
                         working(true);
                     }
@@ -11170,6 +11203,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        crate::submit_stages::report(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
